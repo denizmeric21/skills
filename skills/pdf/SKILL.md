@@ -293,6 +293,47 @@ with open("encrypted.pdf", "wb") as output:
     writer.write(output)
 ```
 
+### Replace Text in a PDF
+
+Use the `scripts/replace_text.py` script. It finds all occurrences of the old
+text (case-insensitive, word-level matching across consecutive words), covers
+them with a white rectangle, and draws the new text on top.
+
+```python
+import subprocess, sys, os
+
+result = subprocess.run(
+    [sys.executable,
+     os.path.join(os.path.dirname(__file__), "scripts/replace_text.py"),
+     INPUT_PDF, os.path.join(OUTPUT_DIR, "replaced.pdf"),
+     "old text here", "new text here"],
+    capture_output=True, text=True
+)
+print(result.stdout)
+if result.returncode != 0:
+    print(result.stderr)
+```
+
+Or call the function directly:
+```python
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+from scripts.replace_text import replace_text
+
+replace_text(
+    input_pdf=INPUT_PDF,
+    output_pdf=os.path.join(OUTPUT_DIR, "replaced.pdf"),
+    old_text="old text here",
+    new_text="new text here",
+)
+```
+
+Notes:
+- Works on PDFs with selectable (non-scanned) text.
+- Matches are case-insensitive and span consecutive words.
+- Font is approximated as Helvetica; size is estimated from the original text height.
+- All occurrences across all pages are replaced.
+
 ## Quick Reference
 
 | Task | Best Tool | Command/Code |
@@ -304,6 +345,7 @@ with open("encrypted.pdf", "wb") as output:
 | Create PDFs | reportlab | Canvas or Platypus |
 | Command line merge | qpdf | `qpdf --empty --pages ...` |
 | OCR scanned PDFs | pytesseract | Convert to image first |
+| Replace text | scripts/replace_text.py | Covers old text, draws new text on top |
 | Fill PDF forms | pdf-lib or pypdf (see FORMS.md) | See FORMS.md |
 
 ## Next Steps
