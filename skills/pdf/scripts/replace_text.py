@@ -30,27 +30,14 @@ import io
 import argparse
 import pdfplumber
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from pypdf import PdfReader, PdfWriter
 
-
-def _font_name(fontname: str) -> str:
-    """Map an embedded font name to the closest standard Helvetica variant."""
-    low = fontname.lower()
-    bold = "bold" in low
-    italic = any(x in low for x in ("italic", "oblique", "it", "slant"))
-    if bold and italic:
-        return "Helvetica-BoldOblique"
-    if bold:
-        return "Helvetica-Bold"
-    if italic:
-        return "Helvetica-Oblique"
-    return "Helvetica"
+from pdf_style_utils import rl_font_name, normalize_color
 
 
 def _wrap_text(text: str, font: str, font_size: float, max_width: float) -> list:
     """Word-wrap text to fit within max_width. Returns list of lines."""
-    # Manual word-wrap using reportlab's string width measurement
-    from reportlab.pdfbase.pdfmetrics import stringWidth
     lines = []
     for paragraph in text.split("\n"):
         words = paragraph.split()
@@ -104,24 +91,12 @@ def find_text_occurrences(pdf_path: str, search_text: str):
                     if sample_chars:
                         sc = sample_chars[0]
                         font_size = sc["size"]
-                        color = sc.get("non_stroking_color") or (0, 0, 0)
-                        rl_font = _font_name(sc.get("fontname", ""))
+                        color = normalize_color(sc.get("non_stroking_color"))
+                        rl_font = rl_font_name(sc.get("fontname", ""))
                     else:
                         font_size = bottom - top
-                        color = (0, 0, 0)
+                        color = (0.0, 0.0, 0.0)
                         rl_font = "Helvetica"
-
-                    # Normalize color to RGB tuple of floats 0-1
-                    if isinstance(color, (int, float)):
-                        color = (color, color, color)  # greyscale
-                    elif len(color) == 4:
-                        # CMYK → RGB
-                        c2, m, y, k = color
-                        color = (
-                            (1 - c2) * (1 - k),
-                            (1 - m) * (1 - k),
-                            (1 - y) * (1 - k),
-                        )
 
                     results.append({
                         "page": page_num,
