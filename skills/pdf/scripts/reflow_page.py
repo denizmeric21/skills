@@ -51,6 +51,204 @@ def _get_stream_bytes(page) -> bytes:
     return obj.get_data()
 
 
+_NUM = r"[-+]?(?:\d+\.\d+|\d+|\.\d+)"
+
+
+def _read_pdf_string(text: str, start: int) -> int:
+    """Return the end offset for a PDF literal string starting at ``start``."""
+    depth = 1
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def _read_pdf_array(text: str, start: int) -> int:
+    """Return the end offset for a PDF array, skipping strings inside it."""
+    depth = 1
+    i = start + 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            i = _read_pdf_string(text, i)
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def _iter_content_tokens(text: str):
+    """
+    Yield non-whitespace PDF content tokens with source offsets.
+
+    This deliberately stays small: it is not a full PDF parser, but it safely
+    skips literal strings and TJ arrays so operator-like text inside strings is
+    not mistaken for an operator.
+    """
+    delimiters = set("()<>[]{}/%")
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "%":
+            end = text.find("\n", i)
+            i = len(text) if end == -1 else end + 1
+            continue
+        if ch == "(":
+            end = _read_pdf_string(text, i)
+            yield {"text": text[i:end], "start": i, "end": end, "kind": "string"}
+            i = end
+            continue
+        if ch == "[":
+            end = _read_pdf_array(text, i)
+            yield {"text": text[i:end], "start": i, "end": end, "kind": "array"}
+            i = end
+            continue
+        if ch == "/":
+            j = i + 1
+            while j < len(text) and (not text[j].isspace()) and text[j] not in delimiters:
+                j += 1
+            yield {"text": text[i:j], "start": i, "end": j, "kind": "name"}
+            i = j
+            continue
+
+        j = i
+        while j < len(text) and (not text[j].isspace()) and text[j] not in delimiters:
+            j += 1
+        if j == i:
+            j += 1
+        token = text[i:j]
+        kind = "number" if re.fullmatch(_NUM, token) else "word"
+        yield {"text": token, "start": i, "end": j, "kind": kind}
+        i = j
+
+
+def _num(token) -> float | None:
+    try:
+        return float(token["text"])
+    except Exception:
+        return None
+
+
+def _shift_text_shows_in_block(
+    block_inner: str,
+    threshold_pdf_y: float,
+    pdf_shift: float,
+    initial_leading: float = 0.0,
+    initial_rise: float = 0.0,
+) -> tuple[str, float, float]:
+    """
+    Shift individual text-show operations below the threshold using text rise.
+
+    The old implementation moved only the first absolute Td/Tm in a BT...ET
+    block. That misses a very common layout shape where one text object draws a
+    heading and several following lines via T*. In that case inserting under
+    the heading left the later lines in place and the new text overprinted them.
+
+    Text rise (Ts) moves glyph rendering without changing the text matrix, so it
+    is safe around Tj/TJ/'/" shows and does not disturb horizontal advances.
+    """
+    tokens = list(_iter_content_tokens(block_inner))
+    if not tokens:
+        return block_inner, initial_leading, initial_rise
+
+    insertions: list[tuple[int, str]] = []
+    stack = []
+    current_y: float | None = None
+    leading = initial_leading
+    rise = initial_rise
+
+    def show_text(op, operand_count: int, advance_line: bool = False) -> None:
+        nonlocal current_y
+        if advance_line and current_y is not None:
+            current_y -= leading
+
+        if current_y is None or current_y >= threshold_pdf_y:
+            return
+
+        if len(stack) >= operand_count:
+            start = stack[-operand_count]["start"]
+        else:
+            start = op["start"]
+
+        shifted_rise = rise + pdf_shift
+        insertions.append((start, f" {shifted_rise:.4f} Ts "))
+        insertions.append((op["end"], f" {rise:.4f} Ts "))
+
+    for token in tokens:
+        text = token["text"]
+
+        if text == "Tm" and len(stack) >= 6:
+            y = _num(stack[-1])
+            if y is not None:
+                current_y = y
+            stack = []
+        elif text in ("Td", "TD") and len(stack) >= 2:
+            ty = _num(stack[-1])
+            if ty is not None:
+                current_y = ty if current_y is None else current_y + ty
+                if text == "TD":
+                    leading = -ty
+            stack = []
+        elif text == "TL" and stack:
+            value = _num(stack[-1])
+            if value is not None:
+                leading = value
+            stack = []
+        elif text == "Ts" and stack:
+            value = _num(stack[-1])
+            if value is not None:
+                rise = value
+            stack = []
+        elif text == "T*":
+            if current_y is not None:
+                current_y -= leading
+            stack = []
+        elif text in ("Tj", "TJ"):
+            show_text(token, 1)
+            stack = []
+        elif text == "'":
+            show_text(token, 1, advance_line=True)
+            stack = []
+        elif text == '"':
+            show_text(token, 3, advance_line=True)
+            stack = []
+        elif token["kind"] in ("number", "string", "array", "name"):
+            stack.append(token)
+        else:
+            stack = []
+
+    if not insertions:
+        return block_inner, leading, rise
+
+    insertions.sort(key=lambda item: item[0])
+    out = []
+    last = 0
+    for pos, snippet in insertions:
+        out.append(block_inner[last:pos])
+        out.append(snippet)
+        last = pos
+    out.append(block_inner[last:])
+    return "".join(out), leading, rise
+
+
 def _shift_stream(stream: bytes, page_height: float, below_plumb_y: float, shift_pts: float) -> bytes:
     """
     Modify y-coordinates in BT...ET blocks that fall below *below_plumb_y*
@@ -73,19 +271,11 @@ def _shift_stream(stream: bytes, page_height: float, below_plumb_y: float, shift
     text = stream.decode("latin-1")
     result = []
     pos = 0
+    leading = 0.0
+    rise = 0.0
 
-    # Find each BT...ET block
     bt_pattern = re.compile(r"\bBT\b")
     et_pattern = re.compile(r"\bET\b")
-
-    # Absolute position: "x y Td" or "a b c d x y Tm"
-    abs_td = re.compile(
-        r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Td"
-    )
-    abs_tm = re.compile(
-        r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
-        r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Tm"
-    )
 
     while pos < len(text):
         bt_m = bt_pattern.search(text, pos)
@@ -103,42 +293,15 @@ def _shift_stream(stream: bytes, page_height: float, below_plumb_y: float, shift
             pos = len(text)
             break
 
-        block = text[bt_start: et_m.end()]
         block_inner = text[bt_m.end(): et_m.start()]
-
-        # Find the first absolute position inside this block
-        first_abs = None
-        tm_m = abs_tm.search(block_inner)
-        td_m = abs_td.search(block_inner)
-
-        # Pick whichever comes first
-        if tm_m and (td_m is None or tm_m.start() < td_m.start()):
-            first_abs = ("tm", tm_m)
-        elif td_m:
-            first_abs = ("td", td_m)
-
-        if first_abs:
-            kind, m = first_abs
-            if kind == "tm":
-                pdf_y = float(m.group(6))
-            else:
-                pdf_y = float(m.group(2))
-
-            if pdf_y < threshold_pdf_y:
-                # This block is below the cut line — shift it
-                new_pdf_y = pdf_y + pdf_shift
-
-                if kind == "tm":
-                    new_op = (
-                        f"{m.group(1)} {m.group(2)} {m.group(3)} "
-                        f"{m.group(4)} {m.group(5)} {new_pdf_y:.4f} Tm"
-                    )
-                    block_inner = block_inner[: m.start()] + new_op + block_inner[m.end():]
-                else:
-                    new_op = f"{m.group(1)} {new_pdf_y:.4f} Td"
-                    block_inner = block_inner[: m.start()] + new_op + block_inner[m.end():]
-
-                block = text[bt_start: bt_m.end()] + block_inner + text[et_m.start(): et_m.end()]
+        shifted_inner, leading, rise = _shift_text_shows_in_block(
+            block_inner,
+            threshold_pdf_y,
+            pdf_shift,
+            initial_leading=leading,
+            initial_rise=rise,
+        )
+        block = text[bt_start: bt_m.end()] + shifted_inner + text[et_m.start(): et_m.end()]
 
         result.append(block)
         pos = et_m.end()
@@ -148,32 +311,15 @@ def _shift_stream(stream: bytes, page_height: float, below_plumb_y: float, shift
 
 def _set_stream_bytes(page, new_bytes: bytes) -> None:
     """Replace the page content stream with new_bytes (uncompressed)."""
-    from pypdf.generic import DecodedStreamObject, NameObject, ByteStringObject
+    from pypdf.generic import DecodedStreamObject, NameObject
+
     contents = page.get("/Contents")
     if contents is None:
         return
-    obj = contents.get_object()
 
-    # Build a new uncompressed stream object
     new_stream = DecodedStreamObject()
     new_stream.set_data(new_bytes)
-    # Remove any existing filter so pypdf doesn't try to decompress again
-    if "/Filter" in new_stream:
-        del new_stream["/Filter"]
-
-    if isinstance(obj, generic.ArrayObject):
-        # Collapse multi-stream to single for simplicity
-        ref = contents  # IndirectObject
-        ref.get_object().clear()
-        # Replace in-place: write to the first stream, drop the rest
-        first = obj[0].get_object()
-        first.set_data(new_bytes)
-        if "/Filter" in first:
-            del first["/Filter"]
-    else:
-        obj.set_data(new_bytes)
-        if "/Filter" in obj:
-            del obj["/Filter"]
+    page[NameObject("/Contents")] = new_stream
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +344,8 @@ def _shift_cm_blocks(stream: bytes, page_height: float, below_plumb_y: float, sh
     def replace_cm(m):
         tx = float(m.group(1))
         ty = float(m.group(2))
+        if abs(tx) < 0.0001 and abs(ty) < 0.0001:
+            return m.group(0)
         if ty < threshold_pdf_y:
             ty += pdf_shift
         return f"1 0 0 1 {tx:.4f} {ty:.4f} cm"

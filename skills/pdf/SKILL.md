@@ -301,6 +301,11 @@ even when the PDF stores words without real spaces between glyphs), removes the
 matched glyphs from the content stream, and draws the new text on top in a
 Helvetica variant with the original color and size.
 
+Use this for true replacements. If the user asks to add new content under or
+after a heading/section, use `scripts/insert_after_text.py` instead. Do not
+replace a heading with "heading + new paragraph"; that usually creates ugly
+overlap and bad text order.
+
 ```python
 import subprocess, sys, os
 
@@ -308,7 +313,7 @@ result = subprocess.run(
     [sys.executable,
      os.path.join(os.path.dirname(__file__), "scripts/replace_text.py"),
      INPUT_PDF, os.path.join(OUTPUT_DIR, "replaced.pdf"),
-     "old text here", "new text here"],
+     "old text here", "new text here", "--mode", "auto"],
     capture_output=True, text=True
 )
 print(result.stdout)
@@ -327,6 +332,7 @@ replace_text(
     output_pdf=os.path.join(OUTPUT_DIR, "replaced.pdf"),
     old_text="old text here",
     new_text="new text here",
+    mode="auto",
 )
 ```
 
@@ -336,19 +342,30 @@ Notes:
 - The new text is drawn in Helvetica (bold/italic approximated). Embedded
   subset fonts cannot render arbitrary new characters, so a standard font is
   used. **Always render the result to PNG and review it visually.**
-- The replacement auto-shrinks to fit the original width so it never overlaps
-  neighboring content.
+- `--mode fit` keeps a one-line replacement in the old span.
+- `--mode reflow` wraps the replacement and shifts content below down.
+- `--mode auto` uses fit for similar-length replacements and reflow for
+  multiline or line-sized replacements that would shrink too much.
 - All occurrences across all pages are replaced.
 
-### Add, Remove, and Reflow Content (layout-preserving)
+### Add, Insert, Remove, and Reflow Content (layout-preserving)
 
 These scripts shift existing content by editing the PDF **content stream
 directly** (adjusting `Td`/`Tm`/`cm` positioning operators). They do NOT redraw
 existing text, so the original embedded fonts, colors, and spacing are kept
 exactly. Coordinates use pdfplumber convention (y=0 at the page top).
 
+- **`scripts/insert_after_text.py`** — insert new text immediately after matched
+  anchor text. Best for "add this under the Experience section" or similar
+  section additions. It samples body text style below the anchor when possible
+  and shifts existing content down.
+  ```
+  python scripts/insert_after_text.py in.pdf out.pdf "Experience" \
+      --text "New bullet or paragraph.\nSecond line."
+  ```
 - **`scripts/add_text_block.py`** — insert a text block at a y-position; all
-  content below shifts down to make room (spills to the next page on overflow).
+  content below shifts down to make room. It does not create a new page on
+  overflow, so render and check the result if inserting near the page bottom.
   ```
   python scripts/add_text_block.py in.pdf out.pdf \
       --page 1 --y 200 --text "New paragraph.\nSecond line." --font-size 11
@@ -378,7 +395,8 @@ spacing, alignment, and that nothing is clipped or overlapping.
 | Create PDFs | reportlab | Canvas or Platypus |
 | Command line merge | qpdf | `qpdf --empty --pages ...` |
 | OCR scanned PDFs | pytesseract | Convert to image first |
-| Replace text | scripts/replace_text.py | Removes old glyphs, draws new text on top |
+| Replace text | scripts/replace_text.py | Fit or reflow true replacements |
+| Insert under/after a section | scripts/insert_after_text.py | Finds anchor text, inserts below, shifts content |
 | Insert a text block | scripts/add_text_block.py | Shifts content below down (stream edit) |
 | Remove a region | scripts/remove_text_block.py | Shifts content below up (stream edit) |
 | Shift / reflow content | scripts/reflow_page.py | Moves content below a y-line (stream edit) |

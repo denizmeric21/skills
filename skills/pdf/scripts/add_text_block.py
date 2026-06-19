@@ -91,9 +91,12 @@ def add_text_block(
     font_size: float = 12.0,
     line_height: float | None = None,
     color: tuple = (0.0, 0.0, 0.0),
+    after_gap: float | None = None,
 ) -> None:
     if line_height is None:
         line_height = font_size * 1.2
+    if after_gap is None:
+        after_gap = max(4.0, font_size * 0.35)
 
     reader = PdfReader(input_pdf)
     total_pages = len(reader.pages)
@@ -111,7 +114,7 @@ def add_text_block(
         block_width = pw - 2 * insert_x
 
     lines = _wrap_text(text, font, font_size, block_width)
-    block_height = len(lines) * line_height
+    block_height = len(lines) * line_height + after_gap
 
     # 1. Shift all content at or below insert_y down by block_height
     raw = _get_stream_bytes(page)
@@ -153,6 +156,8 @@ def main():
                         help="Font for inserted block (default: Helvetica)")
     parser.add_argument("--font-size", type=float, default=12.0)
     parser.add_argument("--line-height", type=float, default=None)
+    parser.add_argument("--after-gap", type=float, default=None,
+                        help="Extra space after the inserted block before shifted content")
     parser.add_argument("--color", default="0,0,0",
                         help="Text color as r,g,b floats 0-1 (default: 0,0,0 = black)")
 
@@ -181,6 +186,7 @@ def main():
         font_size=args.font_size,
         line_height=args.line_height,
         color=color,
+        after_gap=args.after_gap,
     )
 
 

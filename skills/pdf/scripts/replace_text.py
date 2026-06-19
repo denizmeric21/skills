@@ -37,11 +37,13 @@ import argparse
 
 import pdfplumber
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.lib.utils import simpleSplit
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from pypdf import PdfReader, PdfWriter
 import pypdf.generic as generic
 
 from pdf_style_utils import rl_font_name, normalize_color
+from reflow_page import _shift_stream, _shift_cm_blocks
 
 
 def _norm(s: str) -> str:
@@ -110,6 +112,10 @@ def find_text_occurrences(pdf_path: str, search_text: str):
                     results.append({
                         "page": page_num,
                         "x0": x0, "top": top, "x1": x1, "bottom": bottom,
+                        "line_x0": min(c["x0"] for c in line_chars),
+                        "line_x1": max(c["x1"] for c in line_chars),
+                        "line_top": min(c["top"] for c in line_chars),
+                        "line_bottom": max(c["bottom"] for c in line_chars),
                         "page_height": page.height,
                         "page_width": page.width,
                         "font_size": sc["size"],
@@ -138,25 +144,15 @@ def _get_stream_bytes(page) -> bytes:
 
 
 def _set_stream_bytes(page, new_bytes: bytes) -> None:
+    from pypdf.generic import DecodedStreamObject, NameObject
+
     contents = page.get("/Contents")
     if contents is None:
         return
-    obj = contents.get_object()
-    if isinstance(obj, generic.ArrayObject):
-        first = obj[0].get_object()
-        first.set_data(new_bytes)
-        if "/Filter" in first:
-            del first["/Filter"]
-        # Blank out remaining stream parts so they don't duplicate content
-        for item in obj[1:]:
-            so = item.get_object()
-            so.set_data(b"")
-            if "/Filter" in so:
-                del so["/Filter"]
-    else:
-        obj.set_data(new_bytes)
-        if "/Filter" in obj:
-            del obj["/Filter"]
+
+    new_stream = DecodedStreamObject()
+    new_stream.set_data(new_bytes)
+    page[NameObject("/Contents")] = new_stream
 
 
 def _strip_chars_from_tj(stream: bytes, matched_text: str) -> bytes:
@@ -175,6 +171,7 @@ def _strip_chars_from_tj(stream: bytes, matched_text: str) -> bytes:
         return stream
 
     tj_array = re.compile(r"\[(.*?)\]\s*TJ", re.DOTALL)
+    tj_string = re.compile(r"(\((?:[^()\\]|\\.)*\))\s*Tj", re.DOTALL)
     lit_pat = re.compile(r"\((?:[^()\\]|\\.)*\)")
     # Tokenize a literal's inner bytes into glyph units (escapes count as one char)
     glyph_pat = re.compile(r"\\[0-7]{1,3}|\\.|[^\\]")
@@ -231,7 +228,27 @@ def _strip_chars_from_tj(stream: bytes, matched_text: str) -> bytes:
         rebuilt.append(segment[last:])
         return "[" + "".join(rebuilt) + "] TJ"
 
-    return tj_array.sub(repl, text).encode("latin-1")
+    def strip_from_literal(literal: str) -> str:
+        units = lit_letters(literal[1:-1])
+        letters = "".join(letter for _, letter in units)
+        span_start = letters.find(target)
+        if span_start == -1:
+            return literal
+        span_end = span_start + len(target)
+        kept = []
+        letter_idx = 0
+        for token, letter in units:
+            if letter:
+                if not (span_start <= letter_idx < span_end):
+                    kept.append(token)
+                letter_idx += 1
+            elif not (span_start <= letter_idx < span_end):
+                kept.append(token)
+        return "(" + "".join(kept) + ")"
+
+    text = tj_array.sub(repl, text)
+    text = tj_string.sub(lambda m: f"{strip_from_literal(m.group(1))} Tj", text)
+    return text.encode("latin-1")
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +262,34 @@ def _fit_font_size(text: str, font: str, base_size: float, max_width: float) -> 
     if w <= max_width:
         return base_size
     return base_size * (max_width / w)
+
+
+def _wrap_text(text: str, font: str, font_size: float, max_width: float) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        wrapped = simpleSplit(paragraph, font, font_size, max_width)
+        lines.extend(wrapped if wrapped else [""])
+    return lines
+
+
+def _draw_text_lines(
+    c,
+    x: float,
+    y_top: float,
+    page_height: float,
+    lines: list[str],
+    font: str,
+    font_size: float,
+    line_height: float,
+    color: tuple,
+) -> None:
+    r, g, b = color
+    c.setFillColorRGB(r, g, b)
+    c.setFont(font, font_size)
+    y_cursor = page_height - y_top - font_size
+    for line in lines:
+        c.drawString(x, y_cursor, line)
+        y_cursor -= line_height
 
 
 def make_overlay(occurrences: list, new_text: str) -> dict:
@@ -286,7 +331,103 @@ def make_overlay(occurrences: list, new_text: str) -> dict:
     return overlays
 
 
-def replace_text(input_pdf: str, output_pdf: str, old_text: str, new_text: str) -> int:
+def _needs_reflow(occ: dict, new_text: str) -> bool:
+    if "\n" in new_text:
+        return True
+
+    orig_width = occ["x1"] - occ["x0"]
+    line_width = max(1.0, occ.get("line_x1", occ["x1"]) - occ.get("line_x0", occ["x0"]))
+    span_fraction = orig_width / line_width
+    fit_size = _fit_font_size(new_text, occ["rl_font"], occ["font_size"], orig_width)
+    return fit_size < occ["font_size"] * 0.85 and span_fraction >= 0.65
+
+
+def make_reflow_overlay(
+    occurrences: list,
+    new_text: str,
+    block_width: float | None = None,
+    line_height: float | None = None,
+) -> tuple[dict, dict]:
+    by_page = {}
+    for occ in occurrences:
+        by_page.setdefault(occ["page"], []).append(occ)
+
+    overlays = {}
+    shifts = {}
+
+    for pn, occs in by_page.items():
+        occs = sorted(occs, key=lambda item: (item["top"], item["x0"]))
+        ph = occs[0]["page_height"]
+        pw = occs[0]["page_width"]
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(pw, ph))
+        cumulative_shift = 0.0
+        page_shifts = []
+
+        for occ in occs:
+            font = occ["rl_font"]
+            font_size = occ["font_size"]
+            lh = line_height if line_height is not None else font_size * 1.2
+            x = occ["x0"]
+            width = block_width
+            if width is None:
+                width = max(
+                    occ.get("line_x1", occ["x1"]) - x,
+                    occ["x1"] - occ["x0"],
+                )
+
+            lines = _wrap_text(new_text, font, font_size, width)
+            old_height = occ["bottom"] - occ["top"]
+            after_gap = max(3.0, font_size * 0.25)
+            new_height = len(lines) * lh + after_gap
+            delta = max(0.0, new_height - old_height)
+
+            adjusted_top = occ["top"] + cumulative_shift
+            adjusted_bottom = occ["bottom"] + cumulative_shift
+            cover_height = max(old_height, new_height)
+
+            c.setFillColorRGB(1, 1, 1)
+            c.rect(
+                x - 1.5,
+                ph - adjusted_top - cover_height - 1.5,
+                width + 3.0,
+                cover_height + 3.0,
+                fill=1,
+                stroke=0,
+            )
+            _draw_text_lines(
+                c,
+                x,
+                adjusted_top,
+                ph,
+                lines,
+                font,
+                font_size,
+                lh,
+                occ["color"],
+            )
+
+            if delta > 0:
+                page_shifts.append((adjusted_bottom, delta))
+                cumulative_shift += delta
+
+        c.save()
+        buf.seek(0)
+        overlays[pn] = buf
+        shifts[pn] = page_shifts
+
+    return overlays, shifts
+
+
+def replace_text(
+    input_pdf: str,
+    output_pdf: str,
+    old_text: str,
+    new_text: str,
+    mode: str = "auto",
+    block_width: float | None = None,
+    line_height: float | None = None,
+) -> int:
     occurrences = find_text_occurrences(input_pdf, old_text)
 
     if not occurrences:
@@ -295,7 +436,32 @@ def replace_text(input_pdf: str, output_pdf: str, old_text: str, new_text: str) 
 
     print(f'Found {len(occurrences)} occurrence(s) of "{old_text}"')
 
-    overlays = make_overlay(occurrences, new_text)
+    if mode not in ("auto", "fit", "reflow"):
+        raise ValueError("mode must be one of: auto, fit, reflow")
+
+    use_reflow = mode == "reflow" or (
+        mode == "auto" and any(_needs_reflow(occ, new_text) for occ in occurrences)
+    )
+
+    if use_reflow:
+        overlays, shifts_by_page = make_reflow_overlay(
+            occurrences,
+            new_text,
+            block_width=block_width,
+            line_height=line_height,
+        )
+        print("Using reflow replacement mode")
+    else:
+        overlays = make_overlay(occurrences, new_text)
+        shifts_by_page = {}
+        if mode == "auto":
+            tight = [
+                occ for occ in occurrences
+                if _fit_font_size(new_text, occ["rl_font"], occ["font_size"], occ["x1"] - occ["x0"])
+                < occ["font_size"] * 0.85
+            ]
+            if tight:
+                print("Note: replacement was fit into the old span. For added paragraphs, use insert_after_text.py.")
 
     # Which pages need their text layer cleaned, and with what matched strings
     matched_by_page = {}
@@ -310,6 +476,11 @@ def replace_text(input_pdf: str, output_pdf: str, old_text: str, new_text: str) 
             raw = _get_stream_bytes(page)
             for matched in matched_by_page[i]:
                 raw = _strip_chars_from_tj(raw, matched)
+            if i in shifts_by_page:
+                ph = float(page.mediabox.height)
+                for below_y, shift in shifts_by_page[i]:
+                    raw = _shift_stream(raw, ph, below_y, shift)
+                    raw = _shift_cm_blocks(raw, ph, below_y, shift)
             _set_stream_bytes(page, raw)
         if i in overlays:
             overlay_reader = PdfReader(overlays[i])
@@ -331,6 +502,12 @@ def main():
     parser.add_argument("output_pdf")
     parser.add_argument("old_text")
     parser.add_argument("new_text")
+    parser.add_argument("--mode", choices=("auto", "fit", "reflow"), default="auto",
+                        help="fit keeps one-line layout; reflow wraps text and shifts content below")
+    parser.add_argument("--width", type=float, default=None,
+                        help="Text width for reflow mode")
+    parser.add_argument("--line-height", type=float, default=None,
+                        help="Line height for reflow mode")
 
     args = parser.parse_args()
 
@@ -338,7 +515,15 @@ def main():
         print(f"Error: file not found: {args.input_pdf}")
         sys.exit(1)
 
-    count = replace_text(args.input_pdf, args.output_pdf, args.old_text, args.new_text)
+    count = replace_text(
+        args.input_pdf,
+        args.output_pdf,
+        args.old_text,
+        args.new_text.replace("\\n", "\n"),
+        mode=args.mode,
+        block_width=args.width,
+        line_height=args.line_height,
+    )
     sys.exit(0 if count > 0 else 1)
 
 

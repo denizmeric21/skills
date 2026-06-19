@@ -63,9 +63,11 @@ def build_system_prompt(skill_context: str) -> str:
            skill files below: {allowed}.
            Do NOT use any library, module, or approach that is not shown in the
            skill documentation, even if you know it exists.
-        2. Only use the scripts/ files listed in the skill knowledge if the task
-           requires them (form filling). Call them via importlib or subprocess ONLY
-           if explicitly shown in forms.md.
+        2. You may import and call scripts/ files listed in the skill knowledge
+           when they directly match the requested operation. For text edits:
+           use replace_text.py for true replacements, insert_after_text.py for
+           adding content under/after a matched section, and add_text_block.py
+           only when coordinates are known.
         3. If the user's request cannot be fulfilled using the documented skill
            knowledge alone, do NOT attempt it. Instead return a single Python
            statement: raise NotImplementedError("This operation is not supported
