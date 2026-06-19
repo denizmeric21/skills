@@ -296,8 +296,10 @@ with open("encrypted.pdf", "wb") as output:
 ### Replace Text in a PDF
 
 Use the `scripts/replace_text.py` script. It finds all occurrences of the old
-text (case-insensitive, word-level matching across consecutive words), covers
-them with a white rectangle, and draws the new text on top.
+text (case-insensitive, **space-insensitive, character-level** matching — works
+even when the PDF stores words without real spaces between glyphs), removes the
+matched glyphs from the content stream, and draws the new text on top in a
+Helvetica variant with the original color and size.
 
 ```python
 import subprocess, sys, os
@@ -330,9 +332,40 @@ replace_text(
 
 Notes:
 - Works on PDFs with selectable (non-scanned) text.
-- Matches are case-insensitive and span consecutive words.
-- Font is approximated as Helvetica; size is estimated from the original text height.
+- Matching is case-insensitive and space-insensitive (character-level).
+- The new text is drawn in Helvetica (bold/italic approximated). Embedded
+  subset fonts cannot render arbitrary new characters, so a standard font is
+  used. **Always render the result to PNG and review it visually.**
+- The replacement auto-shrinks to fit the original width so it never overlaps
+  neighboring content.
 - All occurrences across all pages are replaced.
+
+### Add, Remove, and Reflow Content (layout-preserving)
+
+These scripts shift existing content by editing the PDF **content stream
+directly** (adjusting `Td`/`Tm`/`cm` positioning operators). They do NOT redraw
+existing text, so the original embedded fonts, colors, and spacing are kept
+exactly. Coordinates use pdfplumber convention (y=0 at the page top).
+
+- **`scripts/add_text_block.py`** — insert a text block at a y-position; all
+  content below shifts down to make room (spills to the next page on overflow).
+  ```
+  python scripts/add_text_block.py in.pdf out.pdf \
+      --page 1 --y 200 --text "New paragraph.\nSecond line." --font-size 11
+  ```
+- **`scripts/remove_text_block.py`** — erase a rectangular region and shift
+  content below upward to close the gap.
+  ```
+  python scripts/remove_text_block.py in.pdf out.pdf --page 2 --y-top 300 --y-bottom 360
+  ```
+- **`scripts/reflow_page.py`** — shift everything below a y-line up or down by
+  an explicit amount (positive = down, negative = up).
+  ```
+  python scripts/reflow_page.py in.pdf out.pdf --page 1 --below-y 400 --shift 30
+  ```
+
+After any edit, re-render the page (`pdftoppm -png` or pypdfium2) and verify
+spacing, alignment, and that nothing is clipped or overlapping.
 
 ## Quick Reference
 
@@ -345,7 +378,10 @@ Notes:
 | Create PDFs | reportlab | Canvas or Platypus |
 | Command line merge | qpdf | `qpdf --empty --pages ...` |
 | OCR scanned PDFs | pytesseract | Convert to image first |
-| Replace text | scripts/replace_text.py | Covers old text, draws new text on top |
+| Replace text | scripts/replace_text.py | Removes old glyphs, draws new text on top |
+| Insert a text block | scripts/add_text_block.py | Shifts content below down (stream edit) |
+| Remove a region | scripts/remove_text_block.py | Shifts content below up (stream edit) |
+| Shift / reflow content | scripts/reflow_page.py | Moves content below a y-line (stream edit) |
 | Fill PDF forms | pdf-lib or pypdf (see FORMS.md) | See FORMS.md |
 
 ## Next Steps
