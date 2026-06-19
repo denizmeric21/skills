@@ -148,6 +148,16 @@ def _snap_overflow_start(input_pdf: str, page_idx: int, spill_start: float) -> f
         return max(0.0, min(c["top"] for c in intersecting) - 1.0)
 
 
+def _has_content_below(input_pdf: str, page_idx: int, y_min: float) -> bool:
+    """Return True if visible text would be affected near/past the page bottom."""
+    with pdfplumber.open(input_pdf) as pdf:
+        page = pdf.pages[page_idx]
+        return any(
+            c["bottom"] >= y_min and c.get("text", "").strip()
+            for c in page.chars
+        )
+
+
 def add_text_block(
     input_pdf: str,
     output_pdf: str,
@@ -190,7 +200,7 @@ def add_text_block(
     continuation_pages = []
     spill_start = ph - bottom_margin - block_height
 
-    if paginate_overflow and spill_start > insert_y:
+    if paginate_overflow and spill_start > insert_y and _has_content_below(input_pdf, page_idx, spill_start):
         spill_start = _snap_overflow_start(input_pdf, page_idx, spill_start)
         continuation_pages = _continuation_pages_from_source(
             page,

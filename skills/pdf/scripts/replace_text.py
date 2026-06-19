@@ -42,10 +42,11 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from pypdf import PdfReader, PdfWriter
 import pypdf.generic as generic
 
-from pdf_style_utils import rl_font_name, normalize_color
+from pdf_style_utils import dominant_text_style
 from reflow_page import _shift_stream, _shift_cm_blocks
 from add_text_block import (
     _continuation_pages_from_source,
+    _has_content_below,
     _snap_overflow_start,
     _white_rect_overlay,
 )
@@ -91,7 +92,9 @@ def find_text_occurrences(pdf_path: str, search_text: str):
             if current_line:
                 lines.append(current_line)
 
-            for line_chars in lines:
+            line_tops = [min(c["top"] for c in line) for line in lines if line]
+
+            for line_index, line_chars in enumerate(lines):
                 line_chars.sort(key=lambda c: c["x0"])
                 norm_chars = [
                     (c["text"].lower(), idx)
@@ -113,7 +116,17 @@ def find_text_occurrences(pdf_path: str, search_text: str):
                     top = min(m["top"] for m in matched)
                     bottom = max(m["bottom"] for m in matched)
 
-                    sc = matched[0]
+                    style = dominant_text_style(matched)
+                    next_tops = [
+                        top - line_tops[line_index]
+                        for top in line_tops[line_index + 1:]
+                        if top > line_tops[line_index]
+                    ]
+                    sampled_line_height = (
+                        next_tops[0]
+                        if next_tops and next_tops[0] < style["font_size"] * 3
+                        else style["font_size"] * 1.2
+                    )
                     results.append({
                         "page": page_num,
                         "x0": x0, "top": top, "x1": x1, "bottom": bottom,
@@ -123,9 +136,10 @@ def find_text_occurrences(pdf_path: str, search_text: str):
                         "line_bottom": max(c["bottom"] for c in line_chars),
                         "page_height": page.height,
                         "page_width": page.width,
-                        "font_size": sc["size"],
-                        "color": normalize_color(sc.get("non_stroking_color")),
-                        "rl_font": rl_font_name(sc.get("fontname", "")),
+                        "font_size": style["font_size"],
+                        "line_height": sampled_line_height,
+                        "color": style["color"],
+                        "rl_font": style["font"],
                         # the literal matched glyphs, in document order
                         "matched_text": "".join(line_chars[mi]["text"] for mi in match_indices),
                     })
@@ -344,7 +358,7 @@ def _needs_reflow(occ: dict, new_text: str) -> bool:
     line_width = max(1.0, occ.get("line_x1", occ["x1"]) - occ.get("line_x0", occ["x0"]))
     span_fraction = orig_width / line_width
     fit_size = _fit_font_size(new_text, occ["rl_font"], occ["font_size"], orig_width)
-    return fit_size < occ["font_size"] * 0.85 and span_fraction >= 0.65
+    return fit_size < occ["font_size"] * 0.98 and span_fraction >= 0.5
 
 
 def make_reflow_overlay(
@@ -372,7 +386,7 @@ def make_reflow_overlay(
         for occ in occs:
             font = occ["rl_font"]
             font_size = occ["font_size"]
-            lh = line_height if line_height is not None else font_size * 1.2
+            lh = line_height if line_height is not None else occ.get("line_height", font_size * 1.2)
             x = occ["x0"]
             width = block_width
             if width is None:
@@ -491,15 +505,16 @@ def replace_text(
                 shifted_from_y = min((below_y for below_y, shift in shifts_by_page[i] if shift > 0), default=None)
                 if paginate_overflow and positive_shift > 0 and shifted_from_y is not None:
                     spill_start = max(shifted_from_y, ph - bottom_margin - positive_shift)
-                    spill_start = _snap_overflow_start(input_pdf, i, spill_start)
-                    continuation_pages = _continuation_pages_from_source(
-                        page,
-                        float(page.mediabox.width),
-                        ph,
-                        overflow_start=spill_start,
-                        top_margin=top_margin,
-                        bottom_margin=bottom_margin,
-                    )
+                    if _has_content_below(input_pdf, i, spill_start):
+                        spill_start = _snap_overflow_start(input_pdf, i, spill_start)
+                        continuation_pages = _continuation_pages_from_source(
+                            page,
+                            float(page.mediabox.width),
+                            ph,
+                            overflow_start=spill_start,
+                            top_margin=top_margin,
+                            bottom_margin=bottom_margin,
+                        )
                 for below_y, shift in shifts_by_page[i]:
                     raw = _shift_stream(raw, ph, below_y, shift)
                     raw = _shift_cm_blocks(raw, ph, below_y, shift)

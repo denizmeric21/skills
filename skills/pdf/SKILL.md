@@ -345,7 +345,9 @@ Notes:
 - `--mode fit` keeps a one-line replacement in the old span.
 - `--mode reflow` wraps the replacement and shifts content below down.
 - `--mode auto` uses fit for similar-length replacements and reflow for
-  multiline or line-sized replacements that would shrink too much.
+  multiline or line-sized replacements that would otherwise shrink the sampled
+  font size. Replacement text samples dominant font family, size, color, and
+  line spacing from the matched text.
 - All occurrences across all pages are replaced.
 
 ### Add, Insert, Remove, and Reflow Content (layout-preserving)
@@ -357,9 +359,10 @@ exactly. Coordinates use pdfplumber convention (y=0 at the page top).
 
 - **`scripts/insert_after_text.py`** — insert new text immediately after matched
   anchor text. Best for "add this under the Experience section" or similar
-  section additions. It samples body text style below the anchor when possible
-  and shifts existing content down. If the shifted lower-page text would clip
-  past the bottom margin, the original PDF vector content from the overflow
+  section additions. It samples the dominant body text style below the anchor
+  when possible (font family, size, color, line spacing, and bullet/dash list
+  prefix) and shifts existing content down. If the shifted lower-page text would
+  clip past the bottom margin, the original PDF vector content from the overflow
   region is carried to continuation page(s) inserted after the edited page.
   ```
   python scripts/insert_after_text.py in.pdf out.pdf "Experience" \

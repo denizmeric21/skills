@@ -23,7 +23,7 @@ import sys
 import pdfplumber
 
 from add_text_block import add_text_block
-from pdf_style_utils import normalize_color, rl_font_name
+from pdf_style_utils import dominant_text_style, is_bold_font
 from replace_text import find_text_occurrences
 
 
@@ -50,21 +50,112 @@ def _bucket_lines(chars: list[dict], tolerance: float = 3.0) -> list[list[dict]]
     return lines
 
 
-def _sample_body_style_below(input_pdf: str, page_idx: int, y_min: float) -> dict | None:
-    """Sample the first non-empty text line below y_min on the same page."""
+def _line_text(chars: list[dict]) -> str:
+    out = []
+    prev = None
+    for char in chars:
+        if prev is not None:
+            gap = char["x0"] - prev["x1"]
+            space_width = max(prev.get("size", 10.0), char.get("size", 10.0)) * 0.28
+            if gap > space_width:
+                out.append(" ")
+        text = char["text"]
+        out.append("•" if text.startswith("(cid:") else text)
+        prev = char
+    return "".join(out).strip()
+
+
+def _list_prefix(text: str) -> str:
+    stripped = text.lstrip()
+    for marker in ("•", "-", "*", "–", "—"):
+        if stripped.startswith(marker + " "):
+            return marker + " "
+    return ""
+
+
+def _add_prefix_if_needed(text: str, prefix: str) -> str:
+    if not prefix:
+        return text
+    out = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if not stripped:
+            out.append(line)
+        elif _list_prefix(stripped):
+            out.append(line)
+        else:
+            out.append(prefix + stripped)
+    return "\n".join(out)
+
+
+def _sample_body_style_below(
+    input_pdf: str,
+    page_idx: int,
+    y_min: float,
+    anchor_font_size: float,
+) -> dict | None:
+    """Sample the dominant body style below y_min on the same page."""
     with pdfplumber.open(input_pdf) as pdf:
         page = pdf.pages[page_idx]
-        chars = [c for c in page.chars if c["top"] >= y_min and c["text"].strip()]
+        chars = [c for c in page.chars if c["top"] >= y_min]
+        line_infos = []
         for line in _bucket_lines(chars):
-            if not line:
+            text = _line_text(line)
+            if not text:
                 continue
-            first = line[0]
-            return {
+            style = dominant_text_style(line)
+            line_infos.append({
+                "text": text,
                 "x": min(c["x0"] for c in line),
-                "font": rl_font_name(first.get("fontname", "")),
-                "font_size": float(first["size"]),
-                "color": normalize_color(first.get("non_stroking_color")),
-            }
+                "x1": max(c["x1"] for c in line),
+                "top": min(c["top"] for c in line),
+                "bottom": max(c["bottom"] for c in line),
+                "bold": any(is_bold_font(c.get("fontname", "")) for c in line if c["text"].strip()),
+                **style,
+            })
+
+        if not line_infos:
+            return None
+
+        candidates = [
+            line for line in line_infos
+            if line["font_size"] <= anchor_font_size * 0.98
+        ] or line_infos
+
+        non_bold = [line for line in candidates if not line["bold"]]
+        if non_bold:
+            candidates = non_bold
+
+        def key(line):
+            color_key = tuple(round(v, 3) for v in line["color"])
+            return (round(line["font_size"], 1), line["font"], color_key)
+
+        common_key = max(
+            {key(line) for line in candidates},
+            key=lambda item: sum(1 for line in candidates if key(line) == item),
+        )
+        styled_lines = [line for line in candidates if key(line) == common_key]
+        sample = styled_lines[0]
+
+        top_diffs = [
+            b["top"] - a["top"]
+            for a, b in zip(styled_lines, styled_lines[1:])
+            if 0 < b["top"] - a["top"] < sample["font_size"] * 3
+        ]
+        line_height = (
+            sorted(top_diffs)[len(top_diffs) // 2]
+            if top_diffs else sample["font_size"] * 1.2
+        )
+
+        return {
+            "x": sample["x"],
+            "font": sample["font"],
+            "font_size": sample["font_size"],
+            "line_height": line_height,
+            "color": sample["color"],
+            "prefix": _list_prefix(sample["text"]),
+            "width": page.width - sample["x"] - 50,
+        }
     return None
 
 
@@ -92,6 +183,7 @@ def insert_after_text(
     line_height: float | None = None,
     color: tuple | None = None,
     style_source: str = "below",
+    match_list_prefix: bool = True,
 ) -> int:
     matches = find_text_occurrences(input_pdf, anchor_text)
     if page_num is not None:
@@ -112,21 +204,29 @@ def insert_after_text(
 
     sampled = None
     if style_source == "below":
-        sampled = _sample_body_style_below(input_pdf, anchor["page"], insert_y)
+        sampled = _sample_body_style_below(
+            input_pdf,
+            anchor["page"],
+            insert_y,
+            anchor_font_size=float(anchor["font_size"]),
+        )
 
     style = sampled or _anchor_style(anchor)
+    insert_text = text
+    if match_list_prefix:
+        insert_text = _add_prefix_if_needed(insert_text, style.get("prefix", ""))
 
     add_text_block(
         input_pdf=input_pdf,
         output_pdf=output_pdf,
         page_num=anchor["page"] + 1,
         insert_y=insert_y,
-        text=text,
+        text=insert_text,
         insert_x=x if x is not None else style["x"],
-        block_width=width,
+        block_width=width if width is not None else style.get("width"),
         font=font or style["font"],
         font_size=font_size if font_size is not None else style["font_size"],
-        line_height=line_height,
+        line_height=line_height if line_height is not None else style.get("line_height"),
         color=color or style["color"],
     )
 
@@ -154,6 +254,8 @@ def main():
     parser.add_argument("--font-size", type=float, default=None, help="Override font size")
     parser.add_argument("--line-height", type=float, default=None, help="Override line height")
     parser.add_argument("--color", default=None, help="Override color as r,g,b floats 0-1")
+    parser.add_argument("--no-match-list-prefix", action="store_true",
+                        help="Do not copy the bullet/dash prefix from surrounding body text")
     parser.add_argument(
         "--style-source",
         choices=("below", "anchor"),
@@ -191,6 +293,7 @@ def main():
         line_height=args.line_height,
         color=color,
         style_source=args.style_source,
+        match_list_prefix=not args.no_match_list_prefix,
     )
     sys.exit(0 if count else 1)
 
