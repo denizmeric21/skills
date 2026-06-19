@@ -39,8 +39,9 @@ import sys
 import pdfplumber
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import simpleSplit
-from pypdf import PdfReader, PdfWriter
+from pypdf import PageObject, PdfReader, PdfWriter
 
+from pdf_style_utils import normalize_color, rl_font_name
 from reflow_page import _get_stream_bytes, _shift_stream, _shift_cm_blocks, _set_stream_bytes
 
 
@@ -79,6 +80,146 @@ def _text_block_overlay(
     return buf
 
 
+def _white_rect_overlay(pw: float, ph: float, y_top: float, y_bottom: float) -> io.BytesIO:
+    """Create an overlay that hides a rectangular band using pdfplumber y coordinates."""
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(pw, ph))
+    c.setFillColorRGB(1, 1, 1)
+    c.rect(0, ph - y_bottom, pw, y_bottom - y_top, fill=1, stroke=0)
+    c.save()
+    buf.seek(0)
+    return buf
+
+
+def _line_text(chars: list[dict]) -> str:
+    """Rebuild a readable line from pdfplumber chars, preserving obvious spaces."""
+    if not chars:
+        return ""
+
+    pieces = []
+    prev = None
+    for char in chars:
+        if prev is not None:
+            gap = char["x0"] - prev["x1"]
+            space_width = max(prev.get("size", 10.0), char.get("size", 10.0)) * 0.28
+            if gap > space_width:
+                pieces.append(" ")
+        pieces.append(char["text"])
+        prev = char
+    return "".join(pieces).strip()
+
+
+def _extract_overflow_lines(input_pdf: str, page_idx: int, y_min: float) -> list[dict]:
+    """
+    Extract text lines that would be pushed off the page.
+
+    We keep per-line x, size, color, and closest standard font. This is a
+    fallback for pagination: existing in-page content is still moved as vector
+    PDF content, but overflow has to be redrawn on a continuation page.
+    """
+    lines: list[dict] = []
+    with pdfplumber.open(input_pdf) as pdf:
+        page = pdf.pages[page_idx]
+        chars = [c for c in page.chars if c["top"] >= y_min]
+        chars.sort(key=lambda c: (round(c["top"], 1), c["x0"]))
+
+        current: list[dict] = []
+        current_top = None
+        for char in chars:
+            if current_top is None or abs(char["top"] - current_top) <= 3:
+                current.append(char)
+                if current_top is None:
+                    current_top = char["top"]
+            else:
+                current.sort(key=lambda c: c["x0"])
+                text = _line_text(current)
+                if text:
+                    first = current[0]
+                    lines.append({
+                        "text": text,
+                        "x": min(c["x0"] for c in current),
+                        "top": min(c["top"] for c in current),
+                        "bottom": max(c["bottom"] for c in current),
+                        "font": rl_font_name(first.get("fontname", "")),
+                        "font_size": float(first["size"]),
+                        "color": normalize_color(first.get("non_stroking_color")),
+                    })
+                current = [char]
+                current_top = char["top"]
+
+        if current:
+            current.sort(key=lambda c: c["x0"])
+            text = _line_text(current)
+            if text:
+                first = current[0]
+                lines.append({
+                    "text": text,
+                    "x": min(c["x0"] for c in current),
+                    "top": min(c["top"] for c in current),
+                    "bottom": max(c["bottom"] for c in current),
+                    "font": rl_font_name(first.get("fontname", "")),
+                    "font_size": float(first["size"]),
+                    "color": normalize_color(first.get("non_stroking_color")),
+                })
+
+    return lines
+
+
+def _continuation_pages(
+    lines: list[dict],
+    pw: float,
+    ph: float,
+    top_margin: float,
+    bottom_margin: float,
+) -> list[PageObject]:
+    """Draw extracted overflow text onto one or more blank continuation pages."""
+    if not lines:
+        return []
+
+    pages: list[PageObject] = []
+    first_top = min(line["top"] for line in lines)
+    current_page = None
+    current_canvas = None
+    current_buffer = None
+    previous_top = first_top
+    y_cursor = top_margin
+
+    def start_page():
+        buf = io.BytesIO()
+        canvas = rl_canvas.Canvas(buf, pagesize=(pw, ph))
+        return buf, canvas
+
+    def finish_page(buf, canvas):
+        canvas.save()
+        buf.seek(0)
+        page = PageObject.create_blank_page(width=pw, height=ph)
+        page.merge_page(PdfReader(buf).pages[0])
+        pages.append(page)
+
+    current_buffer, current_canvas = start_page()
+    for index, line in enumerate(lines):
+        if index == 0:
+            y_cursor = top_margin
+        else:
+            y_cursor += max(line["top"] - previous_top, line["font_size"] * 1.2)
+
+        if y_cursor + line["font_size"] > ph - bottom_margin and current_canvas is not None:
+            finish_page(current_buffer, current_canvas)
+            current_buffer, current_canvas = start_page()
+            y_cursor = top_margin
+
+        r, g, b = line["color"]
+        current_canvas.setFillColorRGB(r, g, b)
+        current_canvas.setFont(line["font"], line["font_size"])
+        current_canvas.drawString(line["x"], ph - y_cursor - line["font_size"], line["text"])
+        previous_top = line["top"]
+
+    if current_canvas is not None:
+        finish_page(current_buffer, current_canvas)
+
+    return pages
+
+
 def add_text_block(
     input_pdf: str,
     output_pdf: str,
@@ -92,6 +233,9 @@ def add_text_block(
     line_height: float | None = None,
     color: tuple = (0.0, 0.0, 0.0),
     after_gap: float | None = None,
+    paginate_overflow: bool = True,
+    top_margin: float = 50.0,
+    bottom_margin: float = 50.0,
 ) -> None:
     if line_height is None:
         line_height = font_size * 1.2
@@ -115,6 +259,19 @@ def add_text_block(
 
     lines = _wrap_text(text, font, font_size, block_width)
     block_height = len(lines) * line_height + after_gap
+    overflow_lines = []
+    continuation_pages = []
+    spill_start = ph - bottom_margin - block_height
+
+    if paginate_overflow and spill_start > insert_y:
+        overflow_lines = _extract_overflow_lines(input_pdf, page_idx, spill_start)
+        continuation_pages = _continuation_pages(
+            overflow_lines,
+            pw,
+            ph,
+            top_margin=top_margin,
+            bottom_margin=bottom_margin,
+        )
 
     # 1. Shift all content at or below insert_y down by block_height
     raw = _get_stream_bytes(page)
@@ -128,15 +285,27 @@ def add_text_block(
     overlay_reader = PdfReader(overlay_buf)
     page.merge_page(overlay_reader.pages[0])
 
+    if continuation_pages:
+        hide_buf = _white_rect_overlay(pw, ph, ph - bottom_margin, ph)
+        page.merge_page(PdfReader(hide_buf).pages[0])
+
     writer = PdfWriter()
     for i, p in enumerate(reader.pages):
         writer.add_page(p)
+        if i == page_idx:
+            for continuation_page in continuation_pages:
+                writer.add_page(continuation_page)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
     print(f"Inserted {len(lines)} line(s) ({block_height:.0f}pt) at page {page_num}, y={insert_y:.0f}")
     print(f"Shifted existing content below down by {block_height:.0f}pt")
+    if continuation_pages:
+        print(
+            f"Moved {len(overflow_lines)} overflow line(s) to "
+            f"{len(continuation_pages)} continuation page(s)"
+        )
     print(f"Saved → {output_pdf}")
 
 
@@ -158,6 +327,12 @@ def main():
     parser.add_argument("--line-height", type=float, default=None)
     parser.add_argument("--after-gap", type=float, default=None,
                         help="Extra space after the inserted block before shifted content")
+    parser.add_argument("--no-paginate-overflow", action="store_true",
+                        help="Allow shifted content to clip at the page bottom")
+    parser.add_argument("--top-margin", type=float, default=50.0,
+                        help="Top margin for continuation pages")
+    parser.add_argument("--bottom-margin", type=float, default=50.0,
+                        help="Bottom margin before content spills to a continuation page")
     parser.add_argument("--color", default="0,0,0",
                         help="Text color as r,g,b floats 0-1 (default: 0,0,0 = black)")
 
@@ -187,6 +362,9 @@ def main():
         line_height=args.line_height,
         color=color,
         after_gap=args.after_gap,
+        paginate_overflow=not args.no_paginate_overflow,
+        top_margin=args.top_margin,
+        bottom_margin=args.bottom_margin,
     )
 
 

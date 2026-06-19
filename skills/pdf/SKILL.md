@@ -358,14 +358,17 @@ exactly. Coordinates use pdfplumber convention (y=0 at the page top).
 - **`scripts/insert_after_text.py`** — insert new text immediately after matched
   anchor text. Best for "add this under the Experience section" or similar
   section additions. It samples body text style below the anchor when possible
-  and shifts existing content down.
+  and shifts existing content down. If the shifted lower-page text would clip
+  past the bottom margin, it is copied to continuation page(s) inserted after
+  the edited page.
   ```
   python scripts/insert_after_text.py in.pdf out.pdf "Experience" \
       --text "New bullet or paragraph.\nSecond line."
   ```
 - **`scripts/add_text_block.py`** — insert a text block at a y-position; all
-  content below shifts down to make room. It does not create a new page on
-  overflow, so render and check the result if inserting near the page bottom.
+  content below shifts down to make room. By default, lower-page text that
+  would overflow is moved to continuation page(s); pass
+  `--no-paginate-overflow` only when clipping is acceptable.
   ```
   python scripts/add_text_block.py in.pdf out.pdf \
       --page 1 --y 200 --text "New paragraph.\nSecond line." --font-size 11
