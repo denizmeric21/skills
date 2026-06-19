@@ -44,6 +44,11 @@ import pypdf.generic as generic
 
 from pdf_style_utils import rl_font_name, normalize_color
 from reflow_page import _shift_stream, _shift_cm_blocks
+from add_text_block import (
+    _continuation_pages_from_source,
+    _snap_overflow_start,
+    _white_rect_overlay,
+)
 
 
 def _norm(s: str) -> str:
@@ -427,6 +432,9 @@ def replace_text(
     mode: str = "auto",
     block_width: float | None = None,
     line_height: float | None = None,
+    paginate_overflow: bool = True,
+    top_margin: float = 50.0,
+    bottom_margin: float = 50.0,
 ) -> int:
     occurrences = find_text_occurrences(input_pdf, old_text)
 
@@ -472,12 +480,26 @@ def replace_text(
     writer = PdfWriter()
 
     for i, page in enumerate(reader.pages):
+        continuation_pages = []
         if i in matched_by_page:
             raw = _get_stream_bytes(page)
             for matched in matched_by_page[i]:
                 raw = _strip_chars_from_tj(raw, matched)
             if i in shifts_by_page:
                 ph = float(page.mediabox.height)
+                positive_shift = sum(shift for _, shift in shifts_by_page[i] if shift > 0)
+                shifted_from_y = min((below_y for below_y, shift in shifts_by_page[i] if shift > 0), default=None)
+                if paginate_overflow and positive_shift > 0 and shifted_from_y is not None:
+                    spill_start = max(shifted_from_y, ph - bottom_margin - positive_shift)
+                    spill_start = _snap_overflow_start(input_pdf, i, spill_start)
+                    continuation_pages = _continuation_pages_from_source(
+                        page,
+                        float(page.mediabox.width),
+                        ph,
+                        overflow_start=spill_start,
+                        top_margin=top_margin,
+                        bottom_margin=bottom_margin,
+                    )
                 for below_y, shift in shifts_by_page[i]:
                     raw = _shift_stream(raw, ph, below_y, shift)
                     raw = _shift_cm_blocks(raw, ph, below_y, shift)
@@ -485,7 +507,14 @@ def replace_text(
         if i in overlays:
             overlay_reader = PdfReader(overlays[i])
             page.merge_page(overlay_reader.pages[0])
+        if continuation_pages:
+            ph = float(page.mediabox.height)
+            pw = float(page.mediabox.width)
+            hide_buf = _white_rect_overlay(pw, ph, ph - bottom_margin, ph)
+            page.merge_page(PdfReader(hide_buf).pages[0])
         writer.add_page(page)
+        for continuation_page in continuation_pages:
+            writer.add_page(continuation_page)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
@@ -508,6 +537,12 @@ def main():
                         help="Text width for reflow mode")
     parser.add_argument("--line-height", type=float, default=None,
                         help="Line height for reflow mode")
+    parser.add_argument("--no-paginate-overflow", action="store_true",
+                        help="Allow shifted content to clip at the page bottom")
+    parser.add_argument("--top-margin", type=float, default=50.0,
+                        help="Top margin for continuation pages")
+    parser.add_argument("--bottom-margin", type=float, default=50.0,
+                        help="Bottom margin before content spills to a continuation page")
 
     args = parser.parse_args()
 
@@ -523,6 +558,9 @@ def main():
         mode=args.mode,
         block_width=args.width,
         line_height=args.line_height,
+        paginate_overflow=not args.no_paginate_overflow,
+        top_margin=args.top_margin,
+        bottom_margin=args.bottom_margin,
     )
     sys.exit(0 if count > 0 else 1)
 

@@ -41,7 +41,6 @@ from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import simpleSplit
 from pypdf import PageObject, PdfReader, PdfWriter
 
-from pdf_style_utils import normalize_color, rl_font_name
 from reflow_page import _get_stream_bytes, _shift_stream, _shift_cm_blocks, _set_stream_bytes
 
 
@@ -91,133 +90,62 @@ def _white_rect_overlay(pw: float, ph: float, y_top: float, y_bottom: float) -> 
     return buf
 
 
-def _line_text(chars: list[dict]) -> str:
-    """Rebuild a readable line from pdfplumber chars, preserving obvious spaces."""
-    if not chars:
-        return ""
-
-    pieces = []
-    prev = None
-    for char in chars:
-        if prev is not None:
-            gap = char["x0"] - prev["x1"]
-            space_width = max(prev.get("size", 10.0), char.get("size", 10.0)) * 0.28
-            if gap > space_width:
-                pieces.append(" ")
-        pieces.append(char["text"])
-        prev = char
-    return "".join(pieces).strip()
-
-
-def _extract_overflow_lines(input_pdf: str, page_idx: int, y_min: float) -> list[dict]:
-    """
-    Extract text lines that would be pushed off the page.
-
-    We keep per-line x, size, color, and closest standard font. This is a
-    fallback for pagination: existing in-page content is still moved as vector
-    PDF content, but overflow has to be redrawn on a continuation page.
-    """
-    lines: list[dict] = []
-    with pdfplumber.open(input_pdf) as pdf:
-        page = pdf.pages[page_idx]
-        chars = [c for c in page.chars if c["top"] >= y_min]
-        chars.sort(key=lambda c: (round(c["top"], 1), c["x0"]))
-
-        current: list[dict] = []
-        current_top = None
-        for char in chars:
-            if current_top is None or abs(char["top"] - current_top) <= 3:
-                current.append(char)
-                if current_top is None:
-                    current_top = char["top"]
-            else:
-                current.sort(key=lambda c: c["x0"])
-                text = _line_text(current)
-                if text:
-                    first = current[0]
-                    lines.append({
-                        "text": text,
-                        "x": min(c["x0"] for c in current),
-                        "top": min(c["top"] for c in current),
-                        "bottom": max(c["bottom"] for c in current),
-                        "font": rl_font_name(first.get("fontname", "")),
-                        "font_size": float(first["size"]),
-                        "color": normalize_color(first.get("non_stroking_color")),
-                    })
-                current = [char]
-                current_top = char["top"]
-
-        if current:
-            current.sort(key=lambda c: c["x0"])
-            text = _line_text(current)
-            if text:
-                first = current[0]
-                lines.append({
-                    "text": text,
-                    "x": min(c["x0"] for c in current),
-                    "top": min(c["top"] for c in current),
-                    "bottom": max(c["bottom"] for c in current),
-                    "font": rl_font_name(first.get("fontname", "")),
-                    "font_size": float(first["size"]),
-                    "color": normalize_color(first.get("non_stroking_color")),
-                })
-
-    return lines
-
-
-def _continuation_pages(
-    lines: list[dict],
+def _continuation_pages_from_source(
+    source_page,
     pw: float,
     ph: float,
+    overflow_start: float,
     top_margin: float,
     bottom_margin: float,
 ) -> list[PageObject]:
-    """Draw extracted overflow text onto one or more blank continuation pages."""
-    if not lines:
+    """
+    Preserve overflow formatting by copying original page graphics to new pages.
+
+    Coordinates use pdfplumber y values. Each continuation page displays a band
+    from the original page, translated so the band begins at top_margin. Content
+    outside the visible band is covered, so bullets, embedded fonts, colors, and
+    vector graphics from the original page are preserved visually.
+    """
+    if overflow_start >= ph:
         return []
 
+    usable_height = ph - top_margin - bottom_margin
+    if usable_height <= 0:
+        raise ValueError("top_margin + bottom_margin must be less than page height")
+
     pages: list[PageObject] = []
-    first_top = min(line["top"] for line in lines)
-    current_page = None
-    current_canvas = None
-    current_buffer = None
-    previous_top = first_top
-    y_cursor = top_margin
-
-    def start_page():
-        buf = io.BytesIO()
-        canvas = rl_canvas.Canvas(buf, pagesize=(pw, ph))
-        return buf, canvas
-
-    def finish_page(buf, canvas):
-        canvas.save()
-        buf.seek(0)
+    band_start = overflow_start
+    while band_start < ph:
         page = PageObject.create_blank_page(width=pw, height=ph)
-        page.merge_page(PdfReader(buf).pages[0])
+        # pdfplumber y grows downward. Positive PDF y translation moves the
+        # original bottom band upward to the continuation page's top margin.
+        page.merge_translated_page(source_page, 0, band_start - top_margin, expand=False)
+
+        mask_buf = io.BytesIO()
+        c = rl_canvas.Canvas(mask_buf, pagesize=(pw, ph))
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(0, ph - top_margin, pw, top_margin, fill=1, stroke=0)
+        c.rect(0, 0, pw, bottom_margin, fill=1, stroke=0)
+        c.save()
+        mask_buf.seek(0)
+        page.merge_page(PdfReader(mask_buf).pages[0])
         pages.append(page)
-
-    current_buffer, current_canvas = start_page()
-    for index, line in enumerate(lines):
-        if index == 0:
-            y_cursor = top_margin
-        else:
-            y_cursor += max(line["top"] - previous_top, line["font_size"] * 1.2)
-
-        if y_cursor + line["font_size"] > ph - bottom_margin and current_canvas is not None:
-            finish_page(current_buffer, current_canvas)
-            current_buffer, current_canvas = start_page()
-            y_cursor = top_margin
-
-        r, g, b = line["color"]
-        current_canvas.setFillColorRGB(r, g, b)
-        current_canvas.setFont(line["font"], line["font_size"])
-        current_canvas.drawString(line["x"], ph - y_cursor - line["font_size"], line["text"])
-        previous_top = line["top"]
-
-    if current_canvas is not None:
-        finish_page(current_buffer, current_canvas)
+        band_start += usable_height
 
     return pages
+
+
+def _snap_overflow_start(input_pdf: str, page_idx: int, spill_start: float) -> float:
+    """Move the overflow cut upward to the top of the first intersecting text line."""
+    with pdfplumber.open(input_pdf) as pdf:
+        page = pdf.pages[page_idx]
+        intersecting = [
+            c for c in page.chars
+            if c["bottom"] >= spill_start and c["top"] <= page.height
+        ]
+        if not intersecting:
+            return spill_start
+        return max(0.0, min(c["top"] for c in intersecting) - 1.0)
 
 
 def add_text_block(
@@ -259,16 +187,16 @@ def add_text_block(
 
     lines = _wrap_text(text, font, font_size, block_width)
     block_height = len(lines) * line_height + after_gap
-    overflow_lines = []
     continuation_pages = []
     spill_start = ph - bottom_margin - block_height
 
     if paginate_overflow and spill_start > insert_y:
-        overflow_lines = _extract_overflow_lines(input_pdf, page_idx, spill_start)
-        continuation_pages = _continuation_pages(
-            overflow_lines,
+        spill_start = _snap_overflow_start(input_pdf, page_idx, spill_start)
+        continuation_pages = _continuation_pages_from_source(
+            page,
             pw,
             ph,
+            overflow_start=spill_start,
             top_margin=top_margin,
             bottom_margin=bottom_margin,
         )
@@ -303,7 +231,7 @@ def add_text_block(
     print(f"Shifted existing content below down by {block_height:.0f}pt")
     if continuation_pages:
         print(
-            f"Moved {len(overflow_lines)} overflow line(s) to "
+            f"Preserved overflowing bottom content on "
             f"{len(continuation_pages)} continuation page(s)"
         )
     print(f"Saved → {output_pdf}")

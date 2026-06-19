@@ -359,15 +359,16 @@ exactly. Coordinates use pdfplumber convention (y=0 at the page top).
   anchor text. Best for "add this under the Experience section" or similar
   section additions. It samples body text style below the anchor when possible
   and shifts existing content down. If the shifted lower-page text would clip
-  past the bottom margin, it is copied to continuation page(s) inserted after
-  the edited page.
+  past the bottom margin, the original PDF vector content from the overflow
+  region is carried to continuation page(s) inserted after the edited page.
   ```
   python scripts/insert_after_text.py in.pdf out.pdf "Experience" \
       --text "New bullet or paragraph.\nSecond line."
   ```
 - **`scripts/add_text_block.py`** — insert a text block at a y-position; all
   content below shifts down to make room. By default, lower-page text that
-  would overflow is moved to continuation page(s); pass
+  would overflow is preserved as original PDF content on continuation page(s);
+  pass
   `--no-paginate-overflow` only when clipping is acceptable.
   ```
   python scripts/add_text_block.py in.pdf out.pdf \
