@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-Insert a text block into a PDF section while preserving surrounding content.
+Insert a new text block into a PDF section while preserving the original
+fonts, colors, and layout of all existing content.
 
-When inserted text is taller than the cleared area, all content below the
-insertion point is shifted down automatically. Words below are redrawn with
-their original font, size, and color sampled from the PDF character data.
-If overflow pushes content past the page bottom, it spills to the next page.
+Strategy:
+  1. Content below the insertion point is shifted down in the content stream
+     directly — original embedded fonts are untouched.
+  2. The new text block is drawn as a reportlab overlay on top, at the
+     insertion point.
+
+The new block uses standard Helvetica (or any font you specify). If you need
+the new text to exactly match the surrounding font, extract the font name from
+the PDF first (e.g. with pdfplumber page.chars) and pass it as --font,
+bearing in mind that embedded subset fonts may not render correctly in new
+overlay content — Helvetica is the safe default.
 
 Usage:
     python scripts/add_text_block.py <input.pdf> <output.pdf> \\
@@ -13,31 +21,27 @@ Usage:
         --text "Line 1\\nLine 2" \\
         [--x <left_x>] [--width <w>] \\
         [--font Helvetica] [--font-size 12] \\
-        [--line-height <lh>] [--margin-bottom <m>]
+        [--line-height <lh>] [--color "r,g,b"]
 
-Coordinates:
-    --page   1-based page number
-    --y      y position from the TOP of the page (pdfplumber convention)
-    --x      left margin for the inserted block (default: 50)
-    --width  width of the inserted text block in points (default: page_width - 2*x)
-
-Note: --font and --font-size apply only to the newly inserted text.
-      Existing words shifted below it keep their original appearance.
+Coordinates use pdfplumber convention: y=0 at page top.
 
 Example:
     python scripts/add_text_block.py in.pdf out.pdf \\
-        --page 1 --y 200 --text "New paragraph here."
+        --page 1 --y 200 --text "New paragraph here." \\
+        --font-size 11
 """
 
 import argparse
+import io
 import os
 import sys
 
 import pdfplumber
+from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import simpleSplit
 from pypdf import PdfReader, PdfWriter
 
-from pdf_style_utils import word_style, build_overlay
+from reflow_page import _get_stream_bytes, _shift_stream, _shift_cm_blocks, _set_stream_bytes
 
 
 def _wrap_text(text: str, font: str, font_size: float, max_width: float) -> list:
@@ -46,6 +50,33 @@ def _wrap_text(text: str, font: str, font_size: float, max_width: float) -> list
         wrapped = simpleSplit(paragraph, font, font_size, max_width)
         lines.extend(wrapped if wrapped else [""])
     return lines
+
+
+def _text_block_overlay(
+    pw: float,
+    ph: float,
+    x: float,
+    y_top: float,
+    lines: list,
+    font: str,
+    font_size: float,
+    line_height: float,
+    color: tuple,
+) -> io.BytesIO:
+    """Draw the new text block as a reportlab overlay PDF page."""
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(pw, ph))
+    r, g, b = color
+    c.setFillColorRGB(r, g, b)
+    c.setFont(font, font_size)
+    # RL baseline for first line: ph - y_top - font_size
+    y_cursor = ph - y_top - font_size
+    for line in lines:
+        c.drawString(x, y_cursor, line)
+        y_cursor -= line_height
+    c.save()
+    buf.seek(0)
+    return buf
 
 
 def add_text_block(
@@ -59,7 +90,7 @@ def add_text_block(
     font: str = "Helvetica",
     font_size: float = 12.0,
     line_height: float | None = None,
-    margin_bottom: float = 4.0,
+    color: tuple = (0.0, 0.0, 0.0),
 ) -> None:
     if line_height is None:
         line_height = font_size * 1.2
@@ -72,119 +103,43 @@ def add_text_block(
         sys.exit(1)
 
     page_idx = page_num - 1
+    page = reader.pages[page_idx]
+    mb = page.mediabox
+    pw, ph = float(mb.width), float(mb.height)
 
-    with pdfplumber.open(input_pdf) as plumber_pdf:
-        plumber_page = plumber_pdf.pages[page_idx]
-        pw = float(plumber_page.width)
-        ph = float(plumber_page.height)
-        chars = plumber_page.chars
+    if block_width is None:
+        block_width = pw - 2 * insert_x
 
-        if block_width is None:
-            block_width = pw - 2 * insert_x
+    lines = _wrap_text(text, font, font_size, block_width)
+    block_height = len(lines) * line_height
 
-        lines = _wrap_text(text, font, font_size, block_width)
-        new_block_h = len(lines) * line_height + margin_bottom
+    # 1. Shift all content at or below insert_y down by block_height
+    raw = _get_stream_bytes(page)
+    modified = _shift_stream(raw, ph, insert_y, block_height)
+    modified = _shift_cm_blocks(modified, ph, insert_y, block_height)
+    _set_stream_bytes(page, modified)
 
-        words_below = [w for w in plumber_page.extract_words() if w["top"] >= insert_y - 1]
-
-    def page_dims(idx):
-        mb = reader.pages[idx].mediabox
-        return float(mb.width), float(mb.height)
-
-    overlays: dict[int, list] = {}
-
-    def ensure(idx):
-        if idx not in overlays:
-            overlays[idx] = []
-
-    # Erase the insertion zone
-    ensure(page_idx)
-    overlays[page_idx].append({
-        "type": "white_rect",
-        "x0": 0, "x1": pw,
-        "y_top": insert_y,
-        "y_bottom": min(ph, insert_y + new_block_h),
-    })
-
-    # Draw the new block (user-specified font/size/color)
-    overlays[page_idx].append({
-        "type": "text_block",
-        "x": insert_x,
-        "y_top": insert_y,
-        "lines": lines,
-        "font": font,
-        "font_size": font_size,
-        "line_height": line_height,
-        "color": (0.0, 0.0, 0.0),
-    })
-
-    content_start_y = insert_y + new_block_h
-
-    if words_below:
-        original_top = min(w["top"] for w in words_below)
-        shift = content_start_y - original_top
-
-        if shift > 0:
-            orig_bottom = max(w["bottom"] for w in words_below)
-            ensure(page_idx)
-            overlays[page_idx].append({
-                "type": "white_rect",
-                "x0": 0, "x1": pw,
-                "y_top": original_top,
-                "y_bottom": orig_bottom,
-            })
-
-        margin_top = 36.0
-        margin_bot = 36.0
-
-        for word in words_below:
-            style = word_style(word, chars)
-            new_top = word["top"] + shift
-            fs = style["font_size"]
-
-            if new_top + fs <= ph - margin_bot:
-                dest_idx = page_idx
-                draw_y = new_top
-            else:
-                dest_idx = page_idx + 1
-                if dest_idx >= total_pages:
-                    print(
-                        f"Warning: '{word['text']}' overflows past last page "
-                        f"(y={new_top:.0f}). Consider adding a page."
-                    )
-                    dest_idx = total_pages - 1
-                    draw_y = margin_top
-                else:
-                    draw_y = margin_top + (new_top - (ph - margin_bot))
-
-            ensure(dest_idx)
-            overlays[dest_idx].append({
-                "type": "text_word",
-                "x": word["x0"],
-                "y_top": draw_y,
-                "text": word["text"],
-                **style,
-            })
+    # 2. Overlay the new text block at insert_y
+    overlay_buf = _text_block_overlay(pw, ph, insert_x, insert_y, lines,
+                                      font, font_size, line_height, color)
+    overlay_reader = PdfReader(overlay_buf)
+    page.merge_page(overlay_reader.pages[0])
 
     writer = PdfWriter()
-    for i, page in enumerate(reader.pages):
-        if i in overlays:
-            dpw, dph = page_dims(i)
-            buf = build_overlay(dpw, dph, overlays[i])
-            overlay_reader = PdfReader(buf)
-            page.merge_page(overlay_reader.pages[0])
-        writer.add_page(page)
+    for i, p in enumerate(reader.pages):
+        writer.add_page(p)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
-    print(f"Inserted {len(lines)} line(s) at page {page_num}, y={insert_y:.0f}")
+    print(f"Inserted {len(lines)} line(s) ({block_height:.0f}pt) at page {page_num}, y={insert_y:.0f}")
+    print(f"Shifted existing content below down by {block_height:.0f}pt")
     print(f"Saved → {output_pdf}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Insert a text block into a PDF, shifting content below downward."
+        description="Insert a text block into a PDF, shifting existing content down (preserves original fonts)."
     )
     parser.add_argument("input_pdf")
     parser.add_argument("output_pdf")
@@ -192,18 +147,26 @@ def main():
     parser.add_argument("--y", type=float, required=True,
                         help="Top of insertion point (pdfplumber, y=0 at page top)")
     parser.add_argument("--text", required=True, help="Text to insert (use \\n for newlines)")
-    parser.add_argument("--x", type=float, default=50.0)
-    parser.add_argument("--width", type=float, default=None)
+    parser.add_argument("--x", type=float, default=50.0, help="Left margin (default 50)")
+    parser.add_argument("--width", type=float, default=None, help="Block width in points")
     parser.add_argument("--font", default="Helvetica",
-                        help="Font for the inserted block (default: Helvetica)")
+                        help="Font for inserted block (default: Helvetica)")
     parser.add_argument("--font-size", type=float, default=12.0)
     parser.add_argument("--line-height", type=float, default=None)
-    parser.add_argument("--margin-bottom", type=float, default=4.0)
+    parser.add_argument("--color", default="0,0,0",
+                        help="Text color as r,g,b floats 0-1 (default: 0,0,0 = black)")
 
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_pdf):
         print(f"Error: file not found: {args.input_pdf}")
+        sys.exit(1)
+
+    try:
+        color = tuple(float(v) for v in args.color.split(","))
+        assert len(color) == 3
+    except Exception:
+        print("Error: --color must be three comma-separated floats, e.g. 0,0,0")
         sys.exit(1)
 
     add_text_block(
@@ -217,7 +180,7 @@ def main():
         font=args.font,
         font_size=args.font_size,
         line_height=args.line_height,
-        margin_bottom=args.margin_bottom,
+        color=color,
     )
 
 

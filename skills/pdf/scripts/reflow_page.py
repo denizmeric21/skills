@@ -1,41 +1,213 @@
 #!/usr/bin/env python3
 """
-Reflow page content: shift everything below a given y-position up or down,
-preserving the original font, size, and color of every word.
-
-Overflow to the next page is handled automatically when a shifted word
-falls below the bottom margin (36pt).
+Reflow page content: shift all text below a given y-position up or down by
+modifying the PDF content stream directly — so original embedded fonts,
+colors, and spacing are perfectly preserved.
 
 Usage:
     python scripts/reflow_page.py <input.pdf> <output.pdf> \\
-        --page <N> --below-y <y> --shift <delta> \\
-        [--x0 <x0>] [--x1 <x1>]
+        --page <N> --below-y <y> --shift <delta>
 
 Arguments:
-    --below-y   Shift words whose top >= this y (pdfplumber: y=0 at top)
-    --shift     Points to shift: positive=down, negative=up
-    --x0/--x1   Horizontal band to restrict shifting (default: full width)
+    --page     1-based page number
+    --below-y  Shift text blocks whose absolute y < (page_height - below_y).
+               Uses pdfplumber convention: y=0 at page top.
+    --shift    Points to shift: positive=down (increases pdfplumber y),
+               negative=up.
 
-Example — push everything below y=400 down by 30 points on page 1:
+How it works:
+    Parses BT...ET blocks in the PDF content stream. For each block whose
+    first absolute position falls in the affected zone, adjusts the y
+    coordinate of the absolute Td/Tm operator. No text is erased or redrawn —
+    the original font subsets and glyph encodings are untouched.
+
+Example:
     python scripts/reflow_page.py in.pdf out.pdf --page 1 --below-y 400 --shift 30
-
-Example — pull content up by 20 points (close a gap):
     python scripts/reflow_page.py in.pdf out.pdf --page 1 --below-y 300 --shift -20
 """
 
 import argparse
+import io
 import os
+import re
 import sys
 
-import pdfplumber
 from pypdf import PdfReader, PdfWriter
+import pypdf.generic as generic
 
-from pdf_style_utils import word_style, build_overlay
+
+# ---------------------------------------------------------------------------
+# Content stream helpers
+# ---------------------------------------------------------------------------
+
+def _get_stream_bytes(page) -> bytes:
+    """Extract the raw (decompressed) content stream bytes from a page."""
+    contents = page.get("/Contents")
+    if contents is None:
+        return b""
+    obj = contents.get_object()
+    if isinstance(obj, generic.ArrayObject):
+        return b" ".join(item.get_object().get_data() for item in obj)
+    return obj.get_data()
 
 
-MARGIN_TOP = 36.0
-MARGIN_BOT = 36.0
+def _shift_stream(stream: bytes, page_height: float, below_plumb_y: float, shift_pts: float) -> bytes:
+    """
+    Modify y-coordinates in BT...ET blocks that fall below *below_plumb_y*
+    (pdfplumber convention, y=0 at top).
 
+    PDF y=0 is at the bottom, so:
+      pdf_y  = page_height - plumb_y
+      affected blocks have pdf_y  < page_height - below_plumb_y
+      i.e. the block starts below the threshold line.
+
+    shift_pts > 0 means shift DOWN in pdfplumber terms → DECREASE pdf_y.
+    shift_pts < 0 means shift UP   in pdfplumber terms → INCREASE pdf_y.
+
+    We adjust only the *first* absolute Td or Tm in each BT...ET block
+    (subsequent Td are relative moves within the block, which are correct).
+    """
+    threshold_pdf_y = page_height - below_plumb_y
+    pdf_shift = -shift_pts  # pdfplumber down = pdf y decrease
+
+    text = stream.decode("latin-1")
+    result = []
+    pos = 0
+
+    # Find each BT...ET block
+    bt_pattern = re.compile(r"\bBT\b")
+    et_pattern = re.compile(r"\bET\b")
+
+    # Absolute position: "x y Td" or "a b c d x y Tm"
+    abs_td = re.compile(
+        r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Td"
+    )
+    abs_tm = re.compile(
+        r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
+        r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Tm"
+    )
+
+    while pos < len(text):
+        bt_m = bt_pattern.search(text, pos)
+        if bt_m is None:
+            result.append(text[pos:])
+            break
+
+        # Everything before BT passes through unchanged
+        result.append(text[pos:bt_m.start()])
+        bt_start = bt_m.start()
+
+        et_m = et_pattern.search(text, bt_m.end())
+        if et_m is None:
+            result.append(text[bt_start:])
+            pos = len(text)
+            break
+
+        block = text[bt_start: et_m.end()]
+        block_inner = text[bt_m.end(): et_m.start()]
+
+        # Find the first absolute position inside this block
+        first_abs = None
+        tm_m = abs_tm.search(block_inner)
+        td_m = abs_td.search(block_inner)
+
+        # Pick whichever comes first
+        if tm_m and (td_m is None or tm_m.start() < td_m.start()):
+            first_abs = ("tm", tm_m)
+        elif td_m:
+            first_abs = ("td", td_m)
+
+        if first_abs:
+            kind, m = first_abs
+            if kind == "tm":
+                pdf_y = float(m.group(6))
+            else:
+                pdf_y = float(m.group(2))
+
+            if pdf_y < threshold_pdf_y:
+                # This block is below the cut line — shift it
+                new_pdf_y = pdf_y + pdf_shift
+
+                if kind == "tm":
+                    new_op = (
+                        f"{m.group(1)} {m.group(2)} {m.group(3)} "
+                        f"{m.group(4)} {m.group(5)} {new_pdf_y:.4f} Tm"
+                    )
+                    block_inner = block_inner[: m.start()] + new_op + block_inner[m.end():]
+                else:
+                    new_op = f"{m.group(1)} {new_pdf_y:.4f} Td"
+                    block_inner = block_inner[: m.start()] + new_op + block_inner[m.end():]
+
+                block = text[bt_start: bt_m.end()] + block_inner + text[et_m.start(): et_m.end()]
+
+        result.append(block)
+        pos = et_m.end()
+
+    return "".join(result).encode("latin-1")
+
+
+def _set_stream_bytes(page, new_bytes: bytes) -> None:
+    """Replace the page content stream with new_bytes (uncompressed)."""
+    from pypdf.generic import DecodedStreamObject, NameObject, ByteStringObject
+    contents = page.get("/Contents")
+    if contents is None:
+        return
+    obj = contents.get_object()
+
+    # Build a new uncompressed stream object
+    new_stream = DecodedStreamObject()
+    new_stream.set_data(new_bytes)
+    # Remove any existing filter so pypdf doesn't try to decompress again
+    if "/Filter" in new_stream:
+        del new_stream["/Filter"]
+
+    if isinstance(obj, generic.ArrayObject):
+        # Collapse multi-stream to single for simplicity
+        ref = contents  # IndirectObject
+        ref.get_object().clear()
+        # Replace in-place: write to the first stream, drop the rest
+        first = obj[0].get_object()
+        first.set_data(new_bytes)
+        if "/Filter" in first:
+            del first["/Filter"]
+    else:
+        obj.set_data(new_bytes)
+        if "/Filter" in obj:
+            del obj["/Filter"]
+
+
+# ---------------------------------------------------------------------------
+# Also shift non-text graphics that use cm (coordinate transform) operators
+# ---------------------------------------------------------------------------
+
+def _shift_cm_blocks(stream: bytes, page_height: float, below_plumb_y: float, shift_pts: float) -> bytes:
+    """
+    Shift standalone graphics positioned with  `1 0 0 1 tx ty cm`  that fall
+    in the affected zone (e.g. images, decorative rules placed via cm).
+    """
+    threshold_pdf_y = page_height - below_plumb_y
+    pdf_shift = -shift_pts
+
+    text = stream.decode("latin-1")
+
+    # Match identity-scale translate: "1 0 0 1 tx ty cm"
+    cm_pat = re.compile(
+        r"\b1\s+0\s+0\s+1\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+cm\b"
+    )
+
+    def replace_cm(m):
+        tx = float(m.group(1))
+        ty = float(m.group(2))
+        if ty < threshold_pdf_y:
+            ty += pdf_shift
+        return f"1 0 0 1 {tx:.4f} {ty:.4f} cm"
+
+    return cm_pat.sub(replace_cm, text).encode("latin-1")
+
+
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
 
 def reflow_page(
     input_pdf: str,
@@ -43,8 +215,6 @@ def reflow_page(
     page_num: int,
     below_y: float,
     shift: float,
-    x0: float | None = None,
-    x1: float | None = None,
 ) -> None:
     reader = PdfReader(input_pdf)
     total_pages = len(reader.pages)
@@ -54,113 +224,43 @@ def reflow_page(
         sys.exit(1)
 
     page_idx = page_num - 1
+    page = reader.pages[page_idx]
+    mb = page.mediabox
+    pw, ph = float(mb.width), float(mb.height)
 
-    with pdfplumber.open(input_pdf) as plumber_pdf:
-        plumber_page = plumber_pdf.pages[page_idx]
-        pw = float(plumber_page.width)
-        ph = float(plumber_page.height)
+    raw = _get_stream_bytes(page)
+    modified = _shift_stream(raw, ph, below_y, shift)
+    modified = _shift_cm_blocks(modified, ph, below_y, shift)
 
-        bx0 = x0 if x0 is not None else 0.0
-        bx1 = x1 if x1 is not None else pw
-
-        words = plumber_page.extract_words()
-        chars = plumber_page.chars
-
-    affected = [
-        w for w in words
-        if w["top"] >= below_y - 1
-        and w["x0"] >= bx0 - 1
-        and w["x1"] <= bx1 + 1
-    ]
-
-    if not affected:
-        print(f"No words found below y={below_y:.0f} in the specified band.")
-        sys.exit(0)
-
-    overlays: dict[int, list] = {}
-
-    def ensure(idx):
-        if idx not in overlays:
-            overlays[idx] = []
-
-    def page_dims(idx):
-        mb = reader.pages[idx].mediabox
-        return float(mb.width), float(mb.height)
-
-    # Erase all affected words from the source page in one rectangle
-    ensure(page_idx)
-    orig_top = min(w["top"] for w in affected)
-    orig_bot = max(w["bottom"] for w in affected)
-    overlays[page_idx].append({
-        "type": "white_rect",
-        "x0": bx0, "x1": bx1,
-        "y_top": orig_top, "y_bottom": orig_bot,
-    })
-
-    overflow_count = 0
-
-    for word in affected:
-        style = word_style(word, chars)
-        new_top = word["top"] + shift
-        fs = style["font_size"]
-
-        if new_top >= MARGIN_TOP and (new_top + fs) <= (ph - MARGIN_BOT):
-            dest_idx = page_idx
-            draw_y = new_top
-        elif new_top < MARGIN_TOP and shift < 0:
-            dest_idx = page_idx
-            draw_y = MARGIN_TOP
-        else:
-            dest_idx = page_idx + 1
-            if dest_idx >= total_pages:
-                print(f"Warning: '{word['text']}' overflows past last page — dropped.")
-                overflow_count += 1
-                continue
-            overshoot = new_top - (ph - MARGIN_BOT)
-            draw_y = MARGIN_TOP + overshoot
-
-        ensure(dest_idx)
-        overlays[dest_idx].append({
-            "type": "text_word",
-            "x": word["x0"],
-            "y_top": draw_y,
-            "text": word["text"],
-            **style,
-        })
+    _set_stream_bytes(page, modified)
 
     writer = PdfWriter()
-    for i, page in enumerate(reader.pages):
-        if i in overlays:
-            dpw, dph = page_dims(i)
-            buf = build_overlay(dpw, dph, overlays[i])
-            overlay_reader = PdfReader(buf)
-            page.merge_page(overlay_reader.pages[0])
-        writer.add_page(page)
+    for i, p in enumerate(reader.pages):
+        writer.add_page(p)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
     direction = "down" if shift > 0 else "up"
-    moved = len(affected) - overflow_count
-    print(f"Shifted {moved} word(s) {direction} by {abs(shift):.0f}pt on page {page_num}")
-    if overflow_count:
-        print(f"Dropped {overflow_count} word(s) that overflowed past the last page")
+    print(f"Shifted content below y={below_y:.0f} {direction} by {abs(shift):.0f}pt on page {page_num}")
     print(f"Saved → {output_pdf}")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Shift content below a y-position up or down, preserving original styles."
+        description="Shift PDF content below a y-position by editing the content stream directly."
     )
     parser.add_argument("input_pdf")
     parser.add_argument("output_pdf")
     parser.add_argument("--page", type=int, required=True)
     parser.add_argument("--below-y", type=float, required=True,
-                        help="Shift words whose top >= this y (pdfplumber, y=0 at top)")
+                        help="Shift content whose top >= this y (pdfplumber, y=0 at top)")
     parser.add_argument("--shift", type=float, required=True,
                         help="Points to shift: positive=down, negative=up")
-    parser.add_argument("--x0", type=float, default=None)
-    parser.add_argument("--x1", type=float, default=None)
 
     args = parser.parse_args()
 
@@ -174,8 +274,6 @@ def main():
         page_num=args.page,
         below_y=args.below_y,
         shift=args.shift,
-        x0=args.x0,
-        x1=args.x1,
     )
 
 

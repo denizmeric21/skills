@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Remove a rectangular text region from a PDF and shift content below upward
-to fill the gap, preserving the original font, size, and color of every word.
+Remove a rectangular text region from a PDF and shift content below upward,
+preserving the original fonts, colors, and layout of all shifted content.
+
+Strategy:
+  1. A white rectangle overlay erases the removed zone (via reportlab merge).
+  2. Content below the removed zone is shifted up by editing the PDF content
+     stream directly — so no text is redrawn and original embedded fonts are
+     kept intact.
 
 Usage:
     python scripts/remove_text_block.py <input.pdf> <output.pdf> \\
-        --page <N> --y-top <t> --y-bottom <b> \\
-        [--x0 <x0>] [--x1 <x1>]
+        --page <N> --y-top <t> --y-bottom <b>
 
-Coordinates:
-    --page     1-based page number
-    --y-top    top of the region to remove (pdfplumber: y=0 at top)
-    --y-bottom bottom of the region to remove
-    --x0       left edge of the removal region (default: 0)
-    --x1       right edge of the removal region (default: page width)
-
-All content whose bounding box is entirely within [x0,x1] x [y_top,y_bottom]
-is erased. Everything strictly below y_bottom is shifted upward by
-(y_bottom - y_top), redrawn with its original font and color.
+Coordinates use pdfplumber convention: y=0 at page top.
 
 Example:
     python scripts/remove_text_block.py in.pdf out.pdf \\
@@ -25,13 +21,28 @@ Example:
 """
 
 import argparse
+import io
 import os
 import sys
 
-import pdfplumber
 from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas as rl_canvas
 
-from pdf_style_utils import word_style, build_overlay
+from reflow_page import _get_stream_bytes, _shift_stream, _shift_cm_blocks, _set_stream_bytes
+
+
+def _white_rect_overlay(pw: float, ph: float, y_top: float, y_bottom: float) -> io.BytesIO:
+    """Build a single-page overlay PDF with a white rectangle covering the removal zone."""
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(pw, ph))
+    # pdfplumber y → reportlab y
+    rl_y = ph - y_bottom
+    h = y_bottom - y_top
+    c.setFillColorRGB(1, 1, 1)
+    c.rect(0, rl_y, pw, h + 2, fill=1, stroke=0)  # +2pt padding
+    c.save()
+    buf.seek(0)
+    return buf
 
 
 def remove_text_block(
@@ -40,8 +51,6 @@ def remove_text_block(
     page_num: int,
     y_top: float,
     y_bottom: float,
-    x0: float | None = None,
-    x1: float | None = None,
 ) -> None:
     reader = PdfReader(input_pdf)
     total_pages = len(reader.pages)
@@ -51,87 +60,46 @@ def remove_text_block(
         sys.exit(1)
 
     page_idx = page_num - 1
+    page = reader.pages[page_idx]
+    mb = page.mediabox
+    pw, ph = float(mb.width), float(mb.height)
+
     removed_height = y_bottom - y_top
 
-    with pdfplumber.open(input_pdf) as plumber_pdf:
-        plumber_page = plumber_pdf.pages[page_idx]
-        pw = float(plumber_page.width)
-        ph = float(plumber_page.height)
+    # 1. Shift content below y_bottom upward in the content stream
+    raw = _get_stream_bytes(page)
+    modified = _shift_stream(raw, ph, y_bottom, -removed_height)
+    modified = _shift_cm_blocks(modified, ph, y_bottom, -removed_height)
+    _set_stream_bytes(page, modified)
 
-        rx0 = x0 if x0 is not None else 0.0
-        rx1 = x1 if x1 is not None else pw
-
-        words = plumber_page.extract_words()
-        chars = plumber_page.chars
-
-    operations = []
-
-    # 1. Erase the removal zone
-    operations.append({
-        "type": "white_rect",
-        "x0": rx0, "x1": rx1,
-        "y_top": y_top, "y_bottom": y_bottom,
-    })
-
-    # 2. Words strictly below the removal zone (within horizontal bounds)
-    words_below = [
-        w for w in words
-        if w["top"] >= y_bottom - 1
-        and w["x0"] >= rx0 - 1
-        and w["x1"] <= rx1 + 1
-    ]
-
-    if words_below:
-        orig_top = min(w["top"] for w in words_below)
-        orig_bottom = max(w["bottom"] for w in words_below)
-
-        # Erase original positions
-        operations.append({
-            "type": "white_rect",
-            "x0": rx0, "x1": rx1,
-            "y_top": orig_top,
-            "y_bottom": orig_bottom,
-        })
-
-        # Redraw each word shifted up, preserving its original style
-        for word in words_below:
-            style = word_style(word, chars)
-            operations.append({
-                "type": "text_word",
-                "x": word["x0"],
-                "y_top": word["top"] - removed_height,
-                "text": word["text"],
-                **style,
-            })
-
-    buf = build_overlay(pw, ph, operations)
-    overlay_reader = PdfReader(buf)
+    # 2. White-out the removal zone with an overlay
+    overlay_buf = _white_rect_overlay(pw, ph, y_top, y_bottom)
+    overlay_reader = PdfReader(overlay_buf)
+    page.merge_page(overlay_reader.pages[0])
 
     writer = PdfWriter()
-    for i, page in enumerate(reader.pages):
-        if i == page_idx:
-            page.merge_page(overlay_reader.pages[0])
-        writer.add_page(page)
+    for i, p in enumerate(reader.pages):
+        writer.add_page(p)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)
 
     print(f"Removed y=[{y_top:.0f},{y_bottom:.0f}] on page {page_num}, "
-          f"shifted {len(words_below)} word(s) up")
+          f"shifted content below up by {removed_height:.0f}pt")
     print(f"Saved → {output_pdf}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Remove a text region and shift content below upward."
+        description="Remove a text region and shift content below upward (preserves original fonts)."
     )
     parser.add_argument("input_pdf")
     parser.add_argument("output_pdf")
     parser.add_argument("--page", type=int, required=True)
-    parser.add_argument("--y-top", type=float, required=True)
-    parser.add_argument("--y-bottom", type=float, required=True)
-    parser.add_argument("--x0", type=float, default=None)
-    parser.add_argument("--x1", type=float, default=None)
+    parser.add_argument("--y-top", type=float, required=True,
+                        help="Top of removal region (pdfplumber y=0 at top)")
+    parser.add_argument("--y-bottom", type=float, required=True,
+                        help="Bottom of removal region")
 
     args = parser.parse_args()
 
@@ -145,8 +113,6 @@ def main():
         page_num=args.page,
         y_top=args.y_top,
         y_bottom=args.y_bottom,
-        x0=args.x0,
-        x1=args.x1,
     )
 
 
