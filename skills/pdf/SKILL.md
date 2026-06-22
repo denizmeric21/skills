@@ -348,6 +348,9 @@ Notes:
   multiline or line-sized replacements that would otherwise shrink the sampled
   font size. Replacement text samples dominant font family, size, color, and
   line spacing from the matched text.
+- Use `--cover line` when replacing most or all of a line and any old glyphs,
+  boxes, or duplicate text remain visible. This erases the original visual line
+  band before drawing the replacement on the original baseline.
 - All occurrences across all pages are replaced.
 
 ### Add, Insert, Remove, and Reflow Content (layout-preserving)

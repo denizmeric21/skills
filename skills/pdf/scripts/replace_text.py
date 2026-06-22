@@ -34,6 +34,7 @@ import os
 import io
 import re
 import argparse
+from statistics import median
 
 import pdfplumber
 from reportlab.pdfgen import canvas as rl_canvas
@@ -110,6 +111,7 @@ def find_text_occurrences(pdf_path: str, search_text: str):
                     x1 = max(m["x1"] for m in matched)
                     top = min(m["top"] for m in matched)
                     bottom = max(m["bottom"] for m in matched)
+                    baseline = median(float(m.get("y0", page.height - bottom)) for m in matched)
 
                     style = dominant_text_style(matched)
                     next_tops = [
@@ -129,6 +131,7 @@ def find_text_occurrences(pdf_path: str, search_text: str):
                         "line_x1": max(c["x1"] for c in line_chars),
                         "line_top": min(c["top"] for c in line_chars),
                         "line_bottom": max(c["bottom"] for c in line_chars),
+                        "baseline": baseline,
                         "page_height": page.height,
                         "page_width": page.width,
                         "font_size": style["font_size"],
@@ -306,7 +309,37 @@ def _draw_text_lines(
         y_cursor -= line_height
 
 
-def make_overlay(occurrences: list, new_text: str) -> dict:
+def _cover_rect_for_occurrence(occ: dict, cover: str = "auto") -> tuple[float, float, float, float]:
+    """Return x, y_bottom, width, height in ReportLab coordinates."""
+    ph = occ["page_height"]
+    font_size = occ["font_size"]
+    line_x0 = occ.get("line_x0", occ["x0"])
+    line_x1 = occ.get("line_x1", occ["x1"])
+    line_width = max(1.0, line_x1 - line_x0)
+    span_fraction = (occ["x1"] - occ["x0"]) / line_width
+
+    use_line = cover == "line" or (cover == "auto" and span_fraction >= 0.6)
+    if use_line:
+        x0 = line_x0
+        x1 = line_x1
+        top = occ.get("line_top", occ["top"])
+        bottom = occ.get("line_bottom", occ["bottom"])
+    else:
+        x0 = occ["x0"]
+        x1 = occ["x1"]
+        top = occ["top"]
+        bottom = occ["bottom"]
+
+    pad_x = max(2.0, font_size * 0.18)
+    pad_y = max(2.0, font_size * 0.25)
+    x = max(0.0, x0 - pad_x)
+    y_bottom = ph - bottom - pad_y
+    width = min(occ["page_width"] - x, (x1 - x0) + pad_x * 2)
+    height = (bottom - top) + pad_y * 2
+    return x, y_bottom, width, height
+
+
+def make_overlay(occurrences: list, new_text: str, cover: str = "auto") -> dict:
     by_page = {}
     for occ in occurrences:
         by_page.setdefault(occ["page"], []).append(occ)
@@ -323,20 +356,17 @@ def make_overlay(occurrences: list, new_text: str) -> dict:
             r, g, b = occ["color"]
             rl_font = occ["rl_font"]
             orig_width = x1 - x0
-            rl_y_bottom = ph - bottom
-            text_h = bottom - top
 
-            # White cover (belt-and-suspenders; stream glyphs are already removed)
-            pad = 1.5
+            # White cover: visual correctness must not depend on successfully
+            # editing every possible encoded PDF text-show operator.
+            cover_x, cover_y, cover_w, cover_h = _cover_rect_for_occurrence(occ, cover=cover)
             c.setFillColorRGB(1, 1, 1)
-            c.rect(x0 - pad, rl_y_bottom - pad,
-                   orig_width + pad * 2, text_h + pad * 2,
-                   fill=1, stroke=0)
+            c.rect(cover_x, cover_y, cover_w, cover_h, fill=1, stroke=0)
 
             draw_size = _fit_font_size(new_text, rl_font, occ["font_size"], orig_width)
             c.setFillColorRGB(r, g, b)
             c.setFont(rl_font, draw_size)
-            c.drawString(x0, rl_y_bottom, new_text)
+            c.drawString(x0, occ.get("baseline", ph - bottom), new_text)
 
         c.save()
         buf.seek(0)
@@ -444,6 +474,7 @@ def replace_text(
     paginate_overflow: bool = True,
     top_margin: float = 50.0,
     bottom_margin: float = 50.0,
+    cover: str = "auto",
 ) -> int:
     occurrences = find_text_occurrences(input_pdf, old_text)
 
@@ -455,6 +486,8 @@ def replace_text(
 
     if mode not in ("auto", "fit", "reflow"):
         raise ValueError("mode must be one of: auto, fit, reflow")
+    if cover not in ("auto", "span", "line"):
+        raise ValueError("cover must be one of: auto, span, line")
 
     use_reflow = mode == "reflow" or (
         mode == "auto" and any(_needs_reflow(occ, new_text) for occ in occurrences)
@@ -469,7 +502,7 @@ def replace_text(
         )
         print("Using reflow replacement mode")
     else:
-        overlays = make_overlay(occurrences, new_text)
+        overlays = make_overlay(occurrences, new_text, cover=cover)
         shifts_by_page = {}
         if mode == "auto":
             tight = [
@@ -553,6 +586,8 @@ def main():
                         help="Top margin for continuation pages")
     parser.add_argument("--bottom-margin", type=float, default=50.0,
                         help="Bottom margin before content spills to a continuation page")
+    parser.add_argument("--cover", choices=("auto", "span", "line"), default="auto",
+                        help="Visual erase region before drawing replacement text")
 
     args = parser.parse_args()
 
@@ -571,6 +606,7 @@ def main():
         paginate_overflow=not args.no_paginate_overflow,
         top_margin=args.top_margin,
         bottom_margin=args.bottom_margin,
+        cover=args.cover,
     )
     sys.exit(0 if count > 0 else 1)
 
