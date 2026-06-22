@@ -4,10 +4,10 @@ Remove a rectangular text region from a PDF and shift content below upward,
 preserving the original fonts, colors, and layout of all shifted content.
 
 Strategy:
-  1. A white rectangle overlay erases the removed zone (via reportlab merge).
-  2. Content below the removed zone is shifted up by editing the PDF content
-     stream directly — so no text is redrawn and original embedded fonts are
-     kept intact.
+  1. The page is recomposed from cropped original PDF vector bands.
+  2. The removed band is omitted, and content below it is moved upward as a
+     whole section, preserving original fonts, colors, images, lines, and
+     shapes.
 
 Usage:
     python scripts/remove_text_block.py <input.pdf> <output.pdf> \\
@@ -21,28 +21,12 @@ Example:
 """
 
 import argparse
-import io
 import os
 import sys
 
 from pypdf import PdfReader, PdfWriter
-from reportlab.pdfgen import canvas as rl_canvas
 
-from reflow_page import _get_stream_bytes, _shift_stream, _shift_cm_blocks, _set_stream_bytes
-
-
-def _white_rect_overlay(pw: float, ph: float, y_top: float, y_bottom: float) -> io.BytesIO:
-    """Build a single-page overlay PDF with a white rectangle covering the removal zone."""
-    buf = io.BytesIO()
-    c = rl_canvas.Canvas(buf, pagesize=(pw, ph))
-    # pdfplumber y → reportlab y
-    rl_y = ph - y_bottom
-    h = y_bottom - y_top
-    c.setFillColorRGB(1, 1, 1)
-    c.rect(0, rl_y, pw, h + 2, fill=1, stroke=0)  # +2pt padding
-    c.save()
-    buf.seek(0)
-    return buf
+from pdf_layout_utils import compose_removed_region_page
 
 
 def remove_text_block(
@@ -66,20 +50,11 @@ def remove_text_block(
 
     removed_height = y_bottom - y_top
 
-    # 1. Shift content below y_bottom upward in the content stream
-    raw = _get_stream_bytes(page)
-    modified = _shift_stream(raw, ph, y_bottom, -removed_height)
-    modified = _shift_cm_blocks(modified, ph, y_bottom, -removed_height)
-    _set_stream_bytes(page, modified)
-
-    # 2. White-out the removal zone with an overlay
-    overlay_buf = _white_rect_overlay(pw, ph, y_top, y_bottom)
-    overlay_reader = PdfReader(overlay_buf)
-    page.merge_page(overlay_reader.pages[0])
+    edited_page = compose_removed_region_page(page, pw, ph, y_top, y_bottom)
 
     writer = PdfWriter()
     for i, p in enumerate(reader.pages):
-        writer.add_page(p)
+        writer.add_page(edited_page if i == page_idx else p)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)

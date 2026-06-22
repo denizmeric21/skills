@@ -43,13 +43,8 @@ from pypdf import PdfReader, PdfWriter
 import pypdf.generic as generic
 
 from pdf_style_utils import dominant_text_style
-from reflow_page import _shift_stream, _shift_cm_blocks
-from add_text_block import (
-    _continuation_pages_from_source,
-    _has_content_below,
-    _snap_overflow_start,
-    _white_rect_overlay,
-)
+from add_text_block import _has_content_below, _snap_overflow_start
+from pdf_layout_utils import compose_shifted_page
 
 
 def _norm(s: str) -> str:
@@ -499,34 +494,34 @@ def replace_text(
             raw = _get_stream_bytes(page)
             for matched in matched_by_page[i]:
                 raw = _strip_chars_from_tj(raw, matched)
+            _set_stream_bytes(page, raw)
             if i in shifts_by_page:
                 ph = float(page.mediabox.height)
-                positive_shift = sum(shift for _, shift in shifts_by_page[i] if shift > 0)
-                shifted_from_y = min((below_y for below_y, shift in shifts_by_page[i] if shift > 0), default=None)
-                if paginate_overflow and positive_shift > 0 and shifted_from_y is not None:
-                    spill_start = max(shifted_from_y, ph - bottom_margin - positive_shift)
-                    if _has_content_below(input_pdf, i, spill_start):
-                        spill_start = _snap_overflow_start(input_pdf, i, spill_start)
-                        continuation_pages = _continuation_pages_from_source(
-                            page,
-                            float(page.mediabox.width),
-                            ph,
-                            overflow_start=spill_start,
-                            top_margin=top_margin,
-                            bottom_margin=bottom_margin,
-                        )
+                pw = float(page.mediabox.width)
                 for below_y, shift in shifts_by_page[i]:
-                    raw = _shift_stream(raw, ph, below_y, shift)
-                    raw = _shift_cm_blocks(raw, ph, below_y, shift)
-            _set_stream_bytes(page, raw)
+                    spill_start = ph - bottom_margin - shift
+                    has_overflow = (
+                        paginate_overflow
+                        and shift > 0
+                        and _has_content_below(input_pdf, i, max(below_y, spill_start))
+                    )
+                    if has_overflow:
+                        spill_start = _snap_overflow_start(input_pdf, i, max(below_y, spill_start))
+                    page, new_continuations = compose_shifted_page(
+                        page,
+                        pw,
+                        ph,
+                        cut_y=below_y,
+                        shift_y=shift,
+                        top_margin=top_margin,
+                        bottom_margin=bottom_margin,
+                        paginate_overflow=has_overflow,
+                        overflow_start=spill_start if has_overflow else None,
+                    )
+                    continuation_pages.extend(new_continuations)
         if i in overlays:
             overlay_reader = PdfReader(overlays[i])
             page.merge_page(overlay_reader.pages[0])
-        if continuation_pages:
-            ph = float(page.mediabox.height)
-            pw = float(page.mediabox.width)
-            hide_buf = _white_rect_overlay(pw, ph, ph - bottom_margin, ph)
-            page.merge_page(PdfReader(hide_buf).pages[0])
         writer.add_page(page)
         for continuation_page in continuation_pages:
             writer.add_page(continuation_page)

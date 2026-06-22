@@ -35,6 +35,8 @@ import sys
 from pypdf import PdfReader, PdfWriter
 import pypdf.generic as generic
 
+from pdf_layout_utils import compose_shifted_page
+
 
 # ---------------------------------------------------------------------------
 # Content stream helpers
@@ -376,15 +378,22 @@ def reflow_page(
     mb = page.mediabox
     pw, ph = float(mb.width), float(mb.height)
 
-    raw = _get_stream_bytes(page)
-    modified = _shift_stream(raw, ph, below_y, shift)
-    modified = _shift_cm_blocks(modified, ph, below_y, shift)
-
-    _set_stream_bytes(page, modified)
+    edited_page, continuation_pages = compose_shifted_page(
+        page,
+        pw,
+        ph,
+        cut_y=below_y,
+        shift_y=shift,
+    )
 
     writer = PdfWriter()
     for i, p in enumerate(reader.pages):
-        writer.add_page(p)
+        if i == page_idx:
+            writer.add_page(edited_page)
+            for continuation_page in continuation_pages:
+                writer.add_page(continuation_page)
+        else:
+            writer.add_page(p)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)

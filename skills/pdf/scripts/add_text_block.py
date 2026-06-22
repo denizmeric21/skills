@@ -4,8 +4,9 @@ Insert a new text block into a PDF section while preserving the original
 fonts, colors, and layout of all existing content.
 
 Strategy:
-  1. Content below the insertion point is shifted down in the content stream
-     directly — original embedded fonts are untouched.
+  1. The page is recomposed from cropped original PDF vector bands. Content
+     below the insertion point is moved as a whole section, so original text,
+     fonts, colors, images, lines, and shapes stay intact.
   2. The new text block is drawn as a reportlab overlay on top, at the
      insertion point.
 
@@ -41,6 +42,7 @@ from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.utils import simpleSplit
 from pypdf import PageObject, PdfReader, PdfWriter
 
+from pdf_layout_utils import compose_shifted_page
 from reflow_page import _get_stream_bytes, _shift_stream, _shift_cm_blocks, _set_stream_bytes
 
 
@@ -197,42 +199,39 @@ def add_text_block(
 
     lines = _wrap_text(text, font, font_size, block_width)
     block_height = len(lines) * line_height + after_gap
-    continuation_pages = []
     spill_start = ph - bottom_margin - block_height
-
-    if paginate_overflow and spill_start > insert_y and _has_content_below(input_pdf, page_idx, spill_start):
+    has_overflow = paginate_overflow and _has_content_below(input_pdf, page_idx, spill_start)
+    if has_overflow:
         spill_start = _snap_overflow_start(input_pdf, page_idx, spill_start)
-        continuation_pages = _continuation_pages_from_source(
-            page,
-            pw,
-            ph,
-            overflow_start=spill_start,
-            top_margin=top_margin,
-            bottom_margin=bottom_margin,
-        )
 
-    # 1. Shift all content at or below insert_y down by block_height
-    raw = _get_stream_bytes(page)
-    modified = _shift_stream(raw, ph, insert_y, block_height)
-    modified = _shift_cm_blocks(modified, ph, insert_y, block_height)
-    _set_stream_bytes(page, modified)
+    # 1. Recompose the page from original vector bands, shifting everything
+    # below the insertion point together: text, shapes, images, and rules.
+    edited_page, continuation_pages = compose_shifted_page(
+        page,
+        pw,
+        ph,
+        cut_y=insert_y,
+        shift_y=block_height,
+        top_margin=top_margin,
+        bottom_margin=bottom_margin,
+        paginate_overflow=has_overflow,
+        overflow_start=spill_start if has_overflow else None,
+    )
 
     # 2. Overlay the new text block at insert_y
     overlay_buf = _text_block_overlay(pw, ph, insert_x, insert_y, lines,
                                       font, font_size, line_height, color)
     overlay_reader = PdfReader(overlay_buf)
-    page.merge_page(overlay_reader.pages[0])
-
-    if continuation_pages:
-        hide_buf = _white_rect_overlay(pw, ph, ph - bottom_margin, ph)
-        page.merge_page(PdfReader(hide_buf).pages[0])
+    edited_page.merge_page(overlay_reader.pages[0])
 
     writer = PdfWriter()
     for i, p in enumerate(reader.pages):
-        writer.add_page(p)
         if i == page_idx:
+            writer.add_page(edited_page)
             for continuation_page in continuation_pages:
                 writer.add_page(continuation_page)
+        else:
+            writer.add_page(p)
 
     with open(output_pdf, "wb") as f:
         writer.write(f)

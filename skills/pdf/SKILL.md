@@ -352,10 +352,10 @@ Notes:
 
 ### Add, Insert, Remove, and Reflow Content (layout-preserving)
 
-These scripts shift existing content by editing the PDF **content stream
-directly** (adjusting `Td`/`Tm`/`cm` positioning operators). They do NOT redraw
-existing text, so the original embedded fonts, colors, and spacing are kept
-exactly. Coordinates use pdfplumber convention (y=0 at the page top).
+These scripts move existing page sections by copying cropped original PDF
+vector bands and translating them. They do NOT redraw existing content, so
+original embedded fonts, colors, shapes, images, rules, and spacing are kept
+visually intact. Coordinates use pdfplumber convention (y=0 at the page top).
 
 - **`scripts/insert_after_text.py`** — insert new text immediately after matched
   anchor text. Best for "add this under the Experience section" or similar
@@ -404,9 +404,9 @@ spacing, alignment, and that nothing is clipped or overlapping.
 | OCR scanned PDFs | pytesseract | Convert to image first |
 | Replace text | scripts/replace_text.py | Fit or reflow true replacements |
 | Insert under/after a section | scripts/insert_after_text.py | Finds anchor text, inserts below, shifts content |
-| Insert a text block | scripts/add_text_block.py | Shifts content below down (stream edit) |
-| Remove a region | scripts/remove_text_block.py | Shifts content below up (stream edit) |
-| Shift / reflow content | scripts/reflow_page.py | Moves content below a y-line (stream edit) |
+| Insert a text block | scripts/add_text_block.py | Moves lower vector band down |
+| Remove a region | scripts/remove_text_block.py | Omits region and moves lower vector band up |
+| Shift / reflow content | scripts/reflow_page.py | Moves content below a y-line as vector bands |
 | Fill PDF forms | pdf-lib or pypdf (see FORMS.md) | See FORMS.md |
 
 ## Next Steps
