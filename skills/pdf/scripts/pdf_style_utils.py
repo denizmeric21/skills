@@ -8,6 +8,21 @@ from collections import Counter
 from statistics import median
 
 
+NAMED_COLORS = {
+    "black": (0.0, 0.0, 0.0),
+    "white": (1.0, 1.0, 1.0),
+    "red": (1.0, 0.0, 0.0),
+    "green": (0.0, 0.5, 0.0),
+    "blue": (0.0, 0.0, 1.0),
+    "gray": (0.5, 0.5, 0.5),
+    "grey": (0.5, 0.5, 0.5),
+    "yellow": (1.0, 1.0, 0.0),
+    "orange": (1.0, 0.55, 0.0),
+    "purple": (0.5, 0.0, 0.5),
+    "brown": (0.45, 0.25, 0.1),
+}
+
+
 def rl_font_name(fontname: str) -> str:
     """Map a PDF font name to the closest built-in ReportLab PDF font."""
     low = (fontname or "").lower()
@@ -56,6 +71,38 @@ def normalize_color(color) -> tuple:
             (1 - y) * (1 - k),
         )
     return (0.0, 0.0, 0.0)
+
+
+def parse_color(value: str) -> tuple:
+    """Parse a color from name, #RRGGBB, RRGGBB, or r,g,b floats/bytes."""
+    raw = value.strip()
+    low = raw.lower()
+    if low in NAMED_COLORS:
+        return NAMED_COLORS[low]
+
+    if raw.startswith("#"):
+        raw = raw[1:]
+    if re_full_hex(raw):
+        return (
+            int(raw[0:2], 16) / 255.0,
+            int(raw[2:4], 16) / 255.0,
+            int(raw[4:6], 16) / 255.0,
+        )
+
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) == 3:
+        nums = [float(p) for p in parts]
+        if any(n > 1 for n in nums):
+            nums = [n / 255.0 for n in nums]
+        return tuple(max(0.0, min(1.0, n)) for n in nums)
+
+    raise ValueError("color must be a name, #RRGGBB, RRGGBB, or r,g,b")
+
+
+def re_full_hex(value: str) -> bool:
+    if len(value) != 6:
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in value)
 
 
 def dominant_text_style(chars: list[dict]) -> dict:

@@ -43,7 +43,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from pypdf import PdfReader, PdfWriter
 import pypdf.generic as generic
 
-from pdf_style_utils import dominant_text_style
+from pdf_style_utils import dominant_text_style, parse_color
 from add_text_block import _has_content_below, _snap_overflow_start
 from pdf_layout_utils import compose_shifted_page
 
@@ -339,7 +339,12 @@ def _cover_rect_for_occurrence(occ: dict, cover: str = "auto") -> tuple[float, f
     return x, y_bottom, width, height
 
 
-def make_overlay(occurrences: list, new_text: str, cover: str = "auto") -> dict:
+def make_overlay(
+    occurrences: list,
+    new_text: str,
+    cover: str = "auto",
+    shrink_to_fit: bool = True,
+) -> dict:
     by_page = {}
     for occ in occurrences:
         by_page.setdefault(occ["page"], []).append(occ)
@@ -363,7 +368,10 @@ def make_overlay(occurrences: list, new_text: str, cover: str = "auto") -> dict:
             c.setFillColorRGB(1, 1, 1)
             c.rect(cover_x, cover_y, cover_w, cover_h, fill=1, stroke=0)
 
-            draw_size = _fit_font_size(new_text, rl_font, occ["font_size"], orig_width)
+            draw_size = (
+                _fit_font_size(new_text, rl_font, occ["font_size"], orig_width)
+                if shrink_to_fit else occ["font_size"]
+            )
             c.setFillColorRGB(r, g, b)
             c.setFont(rl_font, draw_size)
             c.drawString(x0, occ.get("baseline", ph - bottom), new_text)
@@ -383,7 +391,11 @@ def _needs_reflow(occ: dict, new_text: str) -> bool:
     line_width = max(1.0, occ.get("line_x1", occ["x1"]) - occ.get("line_x0", occ["x0"]))
     span_fraction = orig_width / line_width
     fit_size = _fit_font_size(new_text, occ["rl_font"], occ["font_size"], orig_width)
-    return fit_size < occ["font_size"] * 0.98 and span_fraction >= 0.5
+    font_grew = (
+        occ.get("original_font_size") is not None
+        and occ["font_size"] > occ["original_font_size"] * 1.15
+    )
+    return (fit_size < occ["font_size"] * 0.98 or font_grew) and span_fraction >= 0.5
 
 
 def make_reflow_overlay(
@@ -463,6 +475,37 @@ def make_reflow_overlay(
     return overlays, shifts
 
 
+def apply_style_overrides(
+    occurrences: list[dict],
+    font: str | None = None,
+    font_size: float | None = None,
+    scale: float | None = None,
+    color: tuple | None = None,
+) -> list[dict]:
+    """Return occurrence copies with explicit replacement style overrides."""
+    styled = []
+    for occ in occurrences:
+        item = dict(occ)
+        item["original_font_size"] = occ["font_size"]
+        item["original_line_height"] = occ.get("line_height", occ["font_size"] * 1.2)
+        if font is not None:
+            item["rl_font"] = font
+        if font_size is not None:
+            item["font_size"] = font_size
+        elif scale is not None:
+            item["font_size"] = item["font_size"] * scale
+        if scale is not None and font_size is None:
+            item["line_height"] = item.get("line_height", occ["font_size"] * 1.2) * scale
+        elif font_size is not None:
+            original_size = max(0.1, occ["font_size"])
+            factor = font_size / original_size
+            item["line_height"] = item.get("line_height", original_size * 1.2) * factor
+        if color is not None:
+            item["color"] = color
+        styled.append(item)
+    return styled
+
+
 def replace_text(
     input_pdf: str,
     output_pdf: str,
@@ -475,6 +518,11 @@ def replace_text(
     top_margin: float = 50.0,
     bottom_margin: float = 50.0,
     cover: str = "auto",
+    font: str | None = None,
+    font_size: float | None = None,
+    scale: float | None = None,
+    color: tuple | None = None,
+    shrink_to_fit: bool = True,
 ) -> int:
     occurrences = find_text_occurrences(input_pdf, old_text)
 
@@ -488,6 +536,18 @@ def replace_text(
         raise ValueError("mode must be one of: auto, fit, reflow")
     if cover not in ("auto", "span", "line"):
         raise ValueError("cover must be one of: auto, span, line")
+    if scale is not None and scale <= 0:
+        raise ValueError("scale must be positive")
+    if font_size is not None and font_size <= 0:
+        raise ValueError("font_size must be positive")
+
+    occurrences = apply_style_overrides(
+        occurrences,
+        font=font,
+        font_size=font_size,
+        scale=scale,
+        color=color,
+    )
 
     use_reflow = mode == "reflow" or (
         mode == "auto" and any(_needs_reflow(occ, new_text) for occ in occurrences)
@@ -502,7 +562,12 @@ def replace_text(
         )
         print("Using reflow replacement mode")
     else:
-        overlays = make_overlay(occurrences, new_text, cover=cover)
+        overlays = make_overlay(
+            occurrences,
+            new_text,
+            cover=cover,
+            shrink_to_fit=shrink_to_fit,
+        )
         shifts_by_page = {}
         if mode == "auto":
             tight = [
@@ -588,11 +653,27 @@ def main():
                         help="Bottom margin before content spills to a continuation page")
     parser.add_argument("--cover", choices=("auto", "span", "line"), default="auto",
                         help="Visual erase region before drawing replacement text")
+    parser.add_argument("--font", default=None,
+                        help="Override replacement font, e.g. Helvetica-Bold or Times-Italic")
+    parser.add_argument("--font-size", type=float, default=None,
+                        help="Override replacement font size")
+    parser.add_argument("--scale", type=float, default=None,
+                        help="Scale sampled replacement font size, e.g. 1.2 or 0.8")
+    parser.add_argument("--color", default=None,
+                        help="Override replacement color: name, #RRGGBB, RRGGBB, or r,g,b")
+    parser.add_argument("--no-shrink-to-fit", action="store_true",
+                        help="Honor requested font size even if text exceeds the old span width")
 
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_pdf):
         print(f"Error: file not found: {args.input_pdf}")
+        sys.exit(1)
+
+    try:
+        color = parse_color(args.color) if args.color is not None else None
+    except Exception as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
 
     count = replace_text(
@@ -607,6 +688,11 @@ def main():
         top_margin=args.top_margin,
         bottom_margin=args.bottom_margin,
         cover=args.cover,
+        font=args.font,
+        font_size=args.font_size,
+        scale=args.scale,
+        color=color,
+        shrink_to_fit=not args.no_shrink_to_fit,
     )
     sys.exit(0 if count > 0 else 1)
 

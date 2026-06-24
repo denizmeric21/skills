@@ -351,6 +351,25 @@ Notes:
 - Use `--cover line` when replacing most or all of a line and any old glyphs,
   boxes, or duplicate text remain visible. This erases the original visual line
   band before drawing the replacement on the original baseline.
+
+### Change Existing Text Style
+
+Use `scripts/change_text_style.py` for style-only requests such as "make this
+text bigger", "make this text smaller", "make this text red", or "make this
+phrase bold". It keeps the text content the same and redraws it with explicit
+style overrides.
+
+```
+python scripts/change_text_style.py in.pdf out.pdf "target text" \
+    --scale 1.2 --color "#7A1F12" --cover line
+```
+
+Notes:
+- Default mode is `fit`, but unlike replacement fit it does **not** shrink the
+  requested font size back to the old span. This is intentional for style edits.
+- Use `--mode reflow` if larger text should move lower sections down.
+- Use `--shrink-to-fit` only when keeping the styled text inside the old width
+  matters more than honoring the requested size exactly.
 - All occurrences across all pages are replaced.
 
 ### Add, Insert, Remove, and Reflow Content (layout-preserving)
@@ -406,6 +425,7 @@ spacing, alignment, and that nothing is clipped or overlapping.
 | Command line merge | qpdf | `qpdf --empty --pages ...` |
 | OCR scanned PDFs | pytesseract | Convert to image first |
 | Replace text | scripts/replace_text.py | Fit or reflow true replacements |
+| Change text style | scripts/change_text_style.py | Change size, color, or font of existing text |
 | Insert under/after a section | scripts/insert_after_text.py | Finds anchor text, inserts below, shifts content |
 | Insert a text block | scripts/add_text_block.py | Moves lower vector band down |
 | Remove a region | scripts/remove_text_block.py | Omits region and moves lower vector band up |
